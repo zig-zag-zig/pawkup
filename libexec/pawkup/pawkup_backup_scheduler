@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/pawkup_shared"
+
+log() {
+  printf '%s\n' "$1"
+}
+
+main() {
+  ensure_backup_config_interactive_if_missing
+  ensure_backup_config_template
+  apply_backup_schedule
+
+  log "Done."
+  log "Config template: $PAWKUP_ENV_FILE"
+  log "Password file expected at: $PAWKUP_PASSWORD_FILE"
+}
+
+main "$@"

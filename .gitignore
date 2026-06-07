@@ -1,0 +1,14 @@
+.DS_Store
+*.log
+*.tmp
+coverage/
+dist/
+*.tar.gz
+
+# Local backup data and secrets should never be committed.
+.config/
+.local/
+/pawkup/
+restic-password
+rclone.conf
+backup.env

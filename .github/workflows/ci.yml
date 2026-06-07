@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y restic shellcheck
+
+      - name: Syntax check
+        run: |
+          bash -n bin/pawkup libexec/pawkup/pawkup_* tests/run_pawkup_tests install.sh uninstall.sh
+
+      - name: ShellCheck
+        run: |
+          shellcheck bin/pawkup libexec/pawkup/pawkup_* tests/run_pawkup_tests install.sh uninstall.sh
+
+      - name: Tests
+        run: |
+          tests/run_pawkup_tests

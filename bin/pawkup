@@ -1,0 +1,1495 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+PAWKUP_COMMAND_PATH="${PAWKUP_COMMAND_PATH:-$(readlink -f "$0" 2>/dev/null || printf '%s/%s\n' "$BIN_DIR" "$(basename "$0")")}"
+PAWKUP_LIBEXEC_DIR="${PAWKUP_LIBEXEC_DIR:-$BIN_DIR/../libexec/pawkup}"
+
+if [ ! -f "$PAWKUP_LIBEXEC_DIR/pawkup_shared" ]; then
+  printf 'Could not find Pawkup helper scripts at: %s\n' "$PAWKUP_LIBEXEC_DIR" >&2
+  exit 1
+fi
+
+export PAWKUP_COMMAND_PATH
+export PAWKUP_LIBEXEC_DIR
+
+# shellcheck disable=SC1091
+source "$PAWKUP_LIBEXEC_DIR/pawkup_shared"
+
+usage() {
+  cat <<EOF
+Usage:
+  pawkup
+  pawkup backup [--dry-run] [--local-only | --cloud-only | --all]
+  pawkup check [--source local|cloud|all]
+  pawkup restore [--source local|cloud] [args...]
+
+Examples:
+  pawkup
+  pawkup backup --cloud-only
+  pawkup backup --dry-run --local-only
+  pawkup check --source all
+  pawkup restore
+  pawkup restore --source cloud restore latest
+EOF
+}
+
+choose_editor() {
+  if [ -n "${EDITOR:-}" ] && command -v "${EDITOR%% *}" >/dev/null 2>&1; then
+    printf '%s\n' "$EDITOR"
+    return 0
+  fi
+
+  local candidate=""
+  for candidate in nano micro vim vi; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+open_file_in_editor() {
+  local file_path="$1"
+  local editor=""
+
+  editor="$(choose_editor)" || {
+    warn "No text editor was found. Set \$EDITOR or install nano, micro, vim, or vi."
+    return 1
+  }
+
+  mkdir -p "$(dirname "$file_path")"
+  [ -f "$file_path" ] || : > "$file_path"
+  chmod 600 "$file_path" 2>/dev/null || true
+  "$editor" "$file_path"
+}
+
+ensure_interactive_tty() {
+  if [ ! -t 0 ] || [ ! -t 1 ]; then
+    warn "Run 'pawkup' in a terminal for the interactive menu."
+    usage >&2
+    exit 1
+  fi
+}
+
+ensure_cli_backup_config() {
+  ensure_backup_config_interactive_if_missing || return 1
+  ensure_backup_config_template
+  write_backup_path_files
+}
+
+repair_backup_setup_interactive() {
+  local had_config="false" had_password="false" had_include="false" had_exclude="false"
+
+  [ -f "$PAWKUP_ENV_FILE" ] && had_config="true"
+  [ -f "$PAWKUP_PASSWORD_FILE" ] && had_password="true"
+  [ -f "$PAWKUP_INCLUDE_PATHS_FILE" ] && had_include="true"
+  [ -f "$PAWKUP_EXCLUDE_PATHS_FILE" ] && had_exclude="true"
+
+  ensure_cli_backup_config || return 1
+  ensure_restic_password_interactive || return 1
+
+  if [ "$had_config" = "true" ] && [ "$had_password" = "true" ] && [ "$had_include" = "true" ] && [ "$had_exclude" = "true" ]; then
+    success "Backup setup already existed. Missing files were checked and nothing needed to be recreated."
+  else
+    success "Backup setup is ready."
+  fi
+}
+
+show_backup_config_summary() {
+  local remote_name="" password_status="missing" include_count=0 exclude_count=0
+
+  if ! load_backup_settings >/dev/null 2>&1; then
+    printf 'Backup config: not set up yet.\n'
+    printf 'Config file:   %s\n' "$PAWKUP_ENV_FILE"
+    return 0
+  fi
+
+  remote_name="$(restic_repository_remote_name "$CLOUD_RESTIC_REPOSITORY")"
+  [ -f "$RESTIC_PASSWORD_FILE" ] && password_status="present"
+  include_count="$(active_path_entry_count "$PAWKUP_INCLUDE_PATHS_FILE")"
+  exclude_count="$(active_path_entry_count "$PAWKUP_EXCLUDE_PATHS_FILE")"
+
+  printf 'Repository:    %s\n' "$BACKUP_REPOSITORY_NAME"
+  printf 'Local repo:    %s\n' "$LOCAL_RESTIC_REPOSITORY"
+  printf 'Cloud repo:    %s\n' "$CLOUD_RESTIC_REPOSITORY"
+  printf 'Cloud remote:  %s\n' "${remote_name:-n/a}"
+  printf 'Password file: %s (%s)\n' "$RESTIC_PASSWORD_FILE" "$password_status"
+  printf 'Include paths: %s\n' "$include_count"
+  printf 'Exclude paths: %s\n' "$exclude_count"
+  printf 'Retention:     %s\n' "$BACKUP_RETENTION_DESCRIPTION"
+}
+
+show_backup_file_locations() {
+  printf 'Backup config:  %s\n' "$PAWKUP_ENV_FILE"
+  printf 'Help file:      %s\n' "$PAWKUP_CONFIG_DIR/README.txt"
+  printf 'Repo password:  %s\n' "$PAWKUP_PASSWORD_FILE"
+  printf 'Include paths:  %s\n' "$PAWKUP_INCLUDE_PATHS_FILE"
+  printf 'Exclude paths:  %s\n' "$PAWKUP_EXCLUDE_PATHS_FILE"
+  printf 'rclone config:  %s\n' "$PAWKUP_RCLONE_CONFIG"
+  printf 'Runtime state:  %s\n' "$PAWKUP_STATE_DIR"
+  printf 'Error logs:     %s\n' "$PAWKUP_LOG_DIR"
+}
+
+backup_config_defaults_loaded() {
+  ensure_backup_config_template
+  load_backup_settings
+}
+
+write_backup_storage_settings() {
+  local repository_name="$1"
+  local remote_name="$2"
+  local password_file="$3"
+
+  backup_config_defaults_loaded || return 1
+
+  write_backup_config_file \
+    "$repository_name" \
+    "$(default_local_restic_repository "$repository_name")" \
+    "$(default_cloud_restic_repository "$remote_name" "$repository_name")" \
+    "$password_file" \
+    "$BACKUP_SCHEDULE_MODE" \
+    "$BACKUP_ON_CALENDAR" \
+    "$BACKUP_PERSISTENT" \
+    "$BACKUP_ACCURACY_SEC" \
+    "$BACKUP_SCHEDULE_DESCRIPTION" \
+    "$BACKUP_RETENTION_DESCRIPTION" \
+    "$BACKUP_RETENTION_ARGS"
+}
+
+change_repository_name_interactive() {
+  local current_remote="" new_name=""
+
+  if ! backup_config_exists; then
+    current_remote="$(detect_rclone_remote)"
+
+    info "First-time backup setup"
+    printf 'Local and cloud backups will use the same repository folder name.\n'
+    printf 'Default name: %s\n' "$PAWKUP_DEFAULT_REPOSITORY_NAME"
+    printf 'Changing it later means moving the repository, so it is best to pick it now.\n'
+
+    new_name="$(prompt_backup_repository_name_interactive "$PAWKUP_DEFAULT_REPOSITORY_NAME")" || return 1
+    ensure_backup_config_template "$current_remote" "$new_name" || return 1
+    write_backup_path_files || return 1
+
+    success "Backup storage is configured."
+    printf 'Local repo: %s\n' "$(default_local_restic_repository "$new_name")"
+    printf 'Cloud repo: %s\n' "$(default_cloud_restic_repository "$current_remote" "$new_name")"
+    return 0
+  fi
+
+  ensure_backup_config_template || return 1
+  write_backup_path_files || return 1
+  load_backup_settings || return 1
+  current_remote="$(restic_repository_remote_name "$CLOUD_RESTIC_REPOSITORY")"
+  current_remote="${current_remote:-$(detect_rclone_remote)}"
+
+  printf 'Current repository folder name: %s\n' "$BACKUP_REPOSITORY_NAME"
+  printf 'Changing it means future backups will use a different local and cloud repository path.\n'
+
+  new_name="$(prompt_backup_repository_name_interactive "$BACKUP_REPOSITORY_NAME")" || return 1
+  if [ "$new_name" = "$BACKUP_REPOSITORY_NAME" ]; then
+    success "Repository folder name is unchanged."
+    return 0
+  fi
+
+  if ! prompt_yes_no "Switch to '$new_name' for both local and cloud backups?" "n"; then
+    return 1
+  fi
+
+  write_backup_storage_settings "$new_name" "$current_remote" "$RESTIC_PASSWORD_FILE"
+  success "Repository folder name updated."
+  printf 'Local repo: %s\n' "$(default_local_restic_repository "$new_name")"
+  printf 'Cloud repo: %s\n' "$(default_cloud_restic_repository "$current_remote" "$new_name")"
+}
+
+cloud_remote_name_is_valid() {
+  local remote_name
+
+  remote_name="$(trim "$1")"
+  [ -n "$remote_name" ] || return 1
+
+  case "$remote_name" in
+    *:*|*/*|*'['*|*']'*)
+      return 1
+      ;;
+  esac
+
+  return 0
+}
+
+change_cloud_remote_interactive() {
+  local current_remote="" new_remote=""
+
+  ensure_cli_backup_config || return 1
+  backup_config_defaults_loaded || return 1
+  current_remote="$(restic_repository_remote_name "$CLOUD_RESTIC_REPOSITORY")"
+  current_remote="${current_remote:-$(detect_rclone_remote)}"
+
+  while true; do
+    new_remote="$(prompt_text "Cloud rclone remote [$current_remote]: ")"
+    if [ -z "$new_remote" ]; then
+      new_remote="$current_remote"
+    fi
+
+    if cloud_remote_name_is_valid "$new_remote"; then
+      break
+    fi
+
+    warn "Use a plain rclone remote name without / or :"
+  done
+
+  if [ "$new_remote" = "$current_remote" ]; then
+    success "Cloud remote is unchanged."
+    return 0
+  fi
+
+  write_backup_storage_settings "$BACKUP_REPOSITORY_NAME" "$new_remote" "$RESTIC_PASSWORD_FILE"
+  success "Cloud remote updated."
+  printf 'Cloud repo: %s\n' "$(default_cloud_restic_repository "$new_remote" "$BACKUP_REPOSITORY_NAME")"
+}
+
+write_new_restic_password_file_interactive() {
+  local output_file="$1"
+  local password="" confirm=""
+
+  while true; do
+    printf 'New repository password:\n'
+    printf '  1. Generate a strong password automatically\n'
+    printf '  2. Enter a custom password\n'
+    printf '  3. Cancel\n'
+
+    case "$(prompt_text 'Choose an option [1]: ')" in
+      ""|1)
+        password="$(generate_random_password)"
+        write_secret_file "$output_file" "$password"
+        success "A strong password was generated."
+        return 0
+        ;;
+      2)
+        password="$(prompt_hidden_value 'Enter new repo password: ')"
+        if [ -z "$password" ]; then
+          warn "Password cannot be empty."
+          continue
+        fi
+
+        confirm="$(prompt_hidden_value 'Confirm new repo password: ')"
+        if [ "$password" != "$confirm" ]; then
+          warn "Passwords did not match."
+          continue
+        fi
+
+        write_secret_file "$output_file" "$password"
+        success "Custom password accepted."
+        return 0
+        ;;
+      3)
+        warn "Password change cancelled."
+        return 1
+        ;;
+      *)
+        warn "Please choose 1, 2, or 3."
+        ;;
+    esac
+  done
+}
+
+password_rotation_sources() {
+  local source="" status=0
+  local -a sources=()
+
+  if restic_source_repository_exists local; then
+    sources+=("local")
+  fi
+
+  if [ -f "$PAWKUP_RCLONE_CONFIG" ]; then
+    if restic_source_repository_exists cloud; then
+      sources+=("cloud")
+    else
+      status=$?
+      case "$status" in
+        1)
+          ;;
+        *)
+          warn "Cloud repository could not be checked for password rotation."
+          if ! prompt_yes_no "Continue without rotating the cloud repository?" "n"; then
+            return 1
+          fi
+          ;;
+      esac
+    fi
+  fi
+
+  for source in "${sources[@]}"; do
+    printf '%s\n' "$source"
+  done
+}
+
+replace_restic_password_interactive() {
+  local new_password_file="" sources_file=""
+  local -a sources=()
+
+  ensure_cli_backup_config || return 1
+  backup_config_defaults_loaded || return 1
+
+  if [ ! -f "$RESTIC_PASSWORD_FILE" ]; then
+    warn "Repo password file not found at $RESTIC_PASSWORD_FILE"
+    warn "If repositories already exist, recreate the old password file before rotating keys."
+    return 1
+  fi
+
+  sources_file="$(mktemp)"
+  if ! password_rotation_sources > "$sources_file"; then
+    rm -f "$sources_file"
+    return 1
+  fi
+  mapfile -t sources < "$sources_file"
+  rm -f "$sources_file"
+
+  if [ "${#sources[@]}" -gt 0 ]; then
+    printf 'This will add a new restic key, verify it, update %s, then remove the old key for:\n' "$RESTIC_PASSWORD_FILE"
+    printf '  %s\n' "${sources[@]}"
+  else
+    printf 'No initialized local or cloud repository was found.\n'
+    printf 'Only the password file at %s will be replaced.\n' "$RESTIC_PASSWORD_FILE"
+  fi
+
+  if ! prompt_yes_no "Continue?" "n"; then
+    return 1
+  fi
+
+  new_password_file="$(mktemp)"
+  chmod 600 "$new_password_file"
+
+  if ! write_new_restic_password_file_interactive "$new_password_file"; then
+    rm -f "$new_password_file"
+    return 1
+  fi
+
+  if [ "${#sources[@]}" -eq 0 ]; then
+    install_secret_file_from_file "$new_password_file" "$RESTIC_PASSWORD_FILE"
+    rm -f "$new_password_file"
+    success "Repo password file replaced."
+    return 0
+  fi
+
+  if rotate_restic_repository_passwords "$new_password_file" "$RESTIC_PASSWORD_FILE" "${sources[@]}"; then
+    rm -f "$new_password_file"
+    success "Restic repository password rotated."
+    return 0
+  fi
+
+  rm -f "$new_password_file"
+  warn "Password rotation did not complete. The existing password file was kept unless verification had already succeeded."
+  return 1
+}
+
+open_rclone_config_interactive() {
+  ensure_cloud_tools_installed_interactive || return 1
+  rclone config
+}
+
+reconnect_rclone_auth_interactive() {
+  local remote_name=""
+
+  ensure_cli_backup_config || return 1
+  backup_config_defaults_loaded || return 1
+  ensure_cloud_tools_installed_interactive || return 1
+
+  remote_name="$(restic_repository_remote_name "$CLOUD_RESTIC_REPOSITORY")"
+  remote_name="${remote_name:-$(detect_rclone_remote)}"
+  configure_rclone_auth_interactive "$remote_name"
+}
+
+active_path_entries() {
+  local file_path="$1"
+  local raw_line trimmed_line
+
+  [ -f "$file_path" ] || return 0
+
+  while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+    trimmed_line="$(trim "$raw_line")"
+    case "$trimmed_line" in
+      ""|\#*)
+        continue
+        ;;
+    esac
+
+    printf '%s\n' "$trimmed_line"
+  done < "$file_path"
+}
+
+active_path_entry_count() {
+  local file_path="$1"
+  local count=0
+  local _entry=""
+
+  while IFS= read -r _entry; do
+    count=$((count + 1))
+  done < <(active_path_entries "$file_path")
+
+  printf '%s\n' "$count"
+}
+
+path_kind_file() {
+  case "$1" in
+    include) printf '%s\n' "$PAWKUP_INCLUDE_PATHS_FILE" ;;
+    exclude) printf '%s\n' "$PAWKUP_EXCLUDE_PATHS_FILE" ;;
+    *) return 1 ;;
+  esac
+}
+
+path_kind_label() {
+  case "$1" in
+    include) printf '%s\n' "include" ;;
+    exclude) printf '%s\n' "exclude" ;;
+    *) return 1 ;;
+  esac
+}
+
+write_path_file_entries() {
+  local kind="$1"
+  local file_path="" tmp_file="" entry=""
+  shift
+
+  file_path="$(path_kind_file "$kind")" || return 1
+  mkdir -p "$(dirname "$file_path")"
+  tmp_file="$(mktemp)"
+
+  case "$kind" in
+    include)
+      cat > "$tmp_file" <<EOF
+# One path per line.
+# Relative paths are under $PAWKUP_HOME.
+# Absolute paths stay absolute.
+# Wildcards are expanded to matching paths before backup.
+# Examples:
+#   .
+#   .bashrc
+#   ~/Documents
+#   ~/Projects/*
+#   /etc/ssh
+EOF
+      ;;
+    exclude)
+      cat > "$tmp_file" <<EOF
+# One path per line.
+# Relative paths are under $PAWKUP_HOME.
+# Absolute paths stay absolute.
+# Wildcards use restic pattern matching.
+# Example: **/node_modules excludes every node_modules directory under $PAWKUP_HOME.
+EOF
+      ;;
+  esac
+
+  if [ "$#" -gt 0 ]; then
+    printf '\n' >> "$tmp_file"
+    for entry in "$@"; do
+      printf '%s\n' "$entry" >> "$tmp_file"
+    done
+  fi
+
+  mv "$tmp_file" "$file_path"
+  chmod 600 "$file_path"
+}
+
+show_path_entries_menu_text() {
+  local kind="$1"
+  local file_path="" label="" index=1 entry=""
+
+  ensure_cli_backup_config || return 1
+  file_path="$(path_kind_file "$kind")" || return 1
+  label="$(path_kind_label "$kind")"
+
+  printf '%s paths:\n' "${label^}"
+  while IFS= read -r entry; do
+    printf '  %d. %s\n' "$index" "$entry"
+    index=$((index + 1))
+  done < <(active_path_entries "$file_path")
+
+  if [ "$index" -eq 1 ]; then
+    printf '  <none>\n'
+  fi
+
+  printf 'Config file: %s\n' "$file_path"
+}
+
+add_path_entry_interactive() {
+  local kind="$1"
+  local file_path="" raw_input="" normalized_input="" entry=""
+  local -a entries=()
+
+  ensure_cli_backup_config || return 1
+  file_path="$(path_kind_file "$kind")" || return 1
+  raw_input="$(prompt_text "Add $kind path: ")"
+  [ -n "$raw_input" ] || return 1
+
+  normalized_input="$(normalize_backup_config_path "$raw_input")" || {
+    warn "That path is not valid."
+    return 1
+  }
+
+  if [ "$kind" = "exclude" ] && { [ "$normalized_input" = "." ] || [ "$normalized_input" = "/" ]; }; then
+    warn "You cannot exclude your entire home directory or filesystem root."
+    return 1
+  fi
+
+  while IFS= read -r entry; do
+    entries+=("$entry")
+  done < <(active_path_entries "$file_path")
+
+  for entry in "${entries[@]}"; do
+    if [ "$entry" = "$normalized_input" ]; then
+      warn "That path is already listed."
+      return 1
+    fi
+  done
+
+  entries+=("$normalized_input")
+  mapfile -t entries < <(printf '%s\n' "${entries[@]}" | awk '!seen[$0]++' | sort)
+  write_path_file_entries "$kind" "${entries[@]}"
+  success "Saved $normalized_input to the ${kind} list."
+}
+
+remove_path_entry_interactive() {
+  local kind="$1"
+  local file_path="" selection="" index=1 remove_index=-1 entry=""
+  local -a entries=()
+  local -a updated_entries=()
+
+  ensure_cli_backup_config || return 1
+  file_path="$(path_kind_file "$kind")" || return 1
+
+  while IFS= read -r entry; do
+    entries+=("$entry")
+  done < <(active_path_entries "$file_path")
+
+  if [ "${#entries[@]}" -eq 0 ]; then
+    warn "There are no ${kind} paths to remove."
+    return 1
+  fi
+
+  show_path_entries_menu_text "$kind"
+  selection="$(prompt_text "Remove which ${kind} path number? ")"
+  [[ "$selection" =~ ^[0-9]+$ ]] || {
+    warn "Enter a number from the list."
+    return 1
+  }
+
+  remove_index=$((selection - 1))
+  if [ "$remove_index" -lt 0 ] || [ "$remove_index" -ge "${#entries[@]}" ]; then
+    warn "That number is out of range."
+    return 1
+  fi
+
+  for index in "${!entries[@]}"; do
+    if [ "$index" -ne "$remove_index" ]; then
+      updated_entries+=("${entries[$index]}")
+    fi
+  done
+
+  write_path_file_entries "$kind" "${updated_entries[@]}"
+  success "Removed ${entries[$remove_index]} from the ${kind} list."
+}
+
+edit_path_file_in_editor() {
+  local kind="$1"
+  local file_path=""
+
+  ensure_cli_backup_config || return 1
+  file_path="$(path_kind_file "$kind")" || return 1
+  open_file_in_editor "$file_path"
+}
+
+add_recommended_exclude_presets_interactive() {
+  local file_path="" preset="" normalized_preset="" entry=""
+  local -a entries=()
+
+  ensure_cli_backup_config || return 1
+  file_path="$(path_kind_file exclude)" || return 1
+
+  printf 'Recommended cache/build excludes:\n'
+  while IFS= read -r preset; do
+    printf '  %s\n' "$preset"
+  done < <(recommended_exclude_presets)
+
+  if ! prompt_yes_no "Add missing recommended excludes?" "y"; then
+    return 1
+  fi
+
+  while IFS= read -r entry; do
+    entries+=("$entry")
+  done < <(active_path_entries "$file_path")
+
+  while IFS= read -r preset; do
+    normalized_preset="$(normalize_backup_config_path "$preset")" || continue
+    entries+=("$normalized_preset")
+  done < <(recommended_exclude_presets)
+
+  mapfile -t entries < <(printf '%s\n' "${entries[@]}" | awk '!seen[$0]++' | sort)
+  write_path_file_entries exclude "${entries[@]}"
+  success "Recommended exclude presets were added."
+}
+
+show_scheduler_status_with_spacing() {
+  show_backup_schedule_status || true
+}
+
+validate_systemd_calendar_expression() {
+  local expression="$1"
+  command -v systemd-analyze >/dev/null 2>&1 || return 0
+  systemd-analyze calendar "$expression" >/dev/null 2>&1
+}
+
+show_systemd_calendar_preview() {
+  local expression="$1"
+
+  command -v systemd-analyze >/dev/null 2>&1 || return 0
+  systemd-analyze calendar "$expression" | sed -n '1,4p' >&2
+}
+
+validate_systemd_timespan_value() {
+  local value="$1"
+  command -v systemd-analyze >/dev/null 2>&1 || return 0
+  systemd-analyze timespan "$value" >/dev/null 2>&1
+}
+
+show_systemd_timespan_preview() {
+  local value="$1"
+
+  command -v systemd-analyze >/dev/null 2>&1 || return 0
+  systemd-analyze timespan "$value" | sed -n '1,3p' >&2
+}
+
+prompt_backup_mode_interactive() {
+  local current="${1:-cloud-only}"
+
+  while true; do
+    printf 'Backup mode:\n' >&2
+    printf '  1. Local only\n' >&2
+    printf '     Store backups only on this computer.\n' >&2
+    printf '  2. Cloud only\n' >&2
+    printf '     Store backups only in your cloud repository.\n' >&2
+    printf '  3. Local and cloud\n' >&2
+    printf '     Save one copy locally and one copy in the cloud.\n' >&2
+
+    case "$(prompt_text "Choose backup mode [$current]: ")" in
+      "" )
+        printf '%s\n' "$current"
+        return 0
+        ;;
+      1|local|local-only)
+        printf '%s\n' "local-only"
+        return 0
+        ;;
+      2|cloud|cloud-only)
+        printf '%s\n' "cloud-only"
+        return 0
+        ;;
+      3|all|both)
+        printf '%s\n' "all"
+        return 0
+        ;;
+      *)
+        warn "Choose 1, 2, or 3."
+        ;;
+    esac
+  done
+}
+
+prompt_schedule_frequency_interactive() {
+  local current_calendar="$1"
+  local current_description="$2"
+  local selection="" custom_calendar="" custom_description=""
+
+  while true; do
+    printf 'Frequency:\n' >&2
+    printf '  1. Hourly\n' >&2
+    printf '     Run at the top of every hour.\n' >&2
+    printf '  2. Daily\n' >&2
+    printf '     Run once per day at midnight.\n' >&2
+    printf '  3. Weekly\n' >&2
+    printf '     Run every Monday at midnight.\n' >&2
+    printf '  4. Monthly\n' >&2
+    printf '     Run on the first day of each month at midnight.\n' >&2
+    printf '  5. Custom OnCalendar\n' >&2
+    printf '     Enter your own systemd calendar expression.\n' >&2
+
+    selection="$(prompt_text "Choose frequency [$current_description]: ")"
+    case "$selection" in
+      "")
+        printf '%s\t%s\n' "$current_calendar" "$current_description"
+        return 0
+        ;;
+      1|hourly)
+        printf 'hourly\tHourly\n'
+        return 0
+        ;;
+      2|daily)
+        printf 'daily\tDaily\n'
+        return 0
+        ;;
+      3|weekly)
+        printf 'weekly\tWeekly\n'
+        return 0
+        ;;
+      4|monthly)
+        printf 'monthly\tMonthly\n'
+        return 0
+        ;;
+      5|custom)
+        while true; do
+          printf 'Examples:\n' >&2
+          printf '  Mon *-*-* 00:00:00   every Monday at midnight\n' >&2
+          printf '  *-*-* 18:00:00       every day at 18:00\n' >&2
+          printf '  Sat *-*-* 09:30:00   every Saturday at 09:30\n' >&2
+          custom_calendar="$(prompt_text "Custom OnCalendar expression [$current_calendar]: ")"
+          [ -n "$custom_calendar" ] || custom_calendar="$current_calendar"
+
+          if ! validate_systemd_calendar_expression "$custom_calendar"; then
+            warn "That is not a valid systemd calendar expression."
+            continue
+          fi
+
+          show_systemd_calendar_preview "$custom_calendar"
+          custom_description="$(prompt_text "Short label [Custom]: ")"
+          [ -n "$custom_description" ] || custom_description="Custom"
+          printf '%s\t%s\n' "$custom_calendar" "$custom_description"
+          return 0
+        done
+        ;;
+      *)
+        warn "Choose 1, 2, 3, 4, or 5."
+        ;;
+    esac
+  done
+}
+
+prompt_retention_period_unit_interactive() {
+  local default_unit="${1:-weekly}"
+
+  while true; do
+    printf 'Choose the restore-point bucket:\n' >&2
+    printf '  1. Hourly\n' >&2
+    printf '  2. Daily\n' >&2
+    printf '  3. Weekly\n' >&2
+    printf '  4. Monthly\n' >&2
+    printf '  5. Yearly\n' >&2
+
+    case "$(prompt_text "Choose bucket [$default_unit]: ")" in
+      "")
+        printf '%s\n' "$default_unit"
+        return 0
+        ;;
+      1|hourly)
+        printf '%s\n' "hourly"
+        return 0
+        ;;
+      2|daily)
+        printf '%s\n' "daily"
+        return 0
+        ;;
+      3|weekly)
+        printf '%s\n' "weekly"
+        return 0
+        ;;
+      4|monthly)
+        printf '%s\n' "monthly"
+        return 0
+        ;;
+      5|yearly)
+        printf '%s\n' "yearly"
+        return 0
+        ;;
+      *)
+        warn "Choose 1, 2, 3, 4, or 5."
+        ;;
+    esac
+  done
+}
+
+prompt_accuracy_window_interactive() {
+  local current="${1:-1min}"
+  local choice="" custom_value=""
+
+  while true; do
+    printf 'Timer accuracy window:\n' >&2
+    printf '  1. 1 minute\n' >&2
+    printf '     Recommended. The backup starts close to the scheduled time.\n' >&2
+    printf '  2. 5 minutes\n' >&2
+    printf '  3. 15 minutes\n' >&2
+    printf '  4. 1 hour\n' >&2
+    printf '  5. Custom value\n' >&2
+    printf '     Examples: 30s, 1min, 5min, 1h\n' >&2
+
+    choice="$(prompt_text "Choose accuracy window [$current]: ")"
+    case "$choice" in
+      "")
+        printf '%s\n' "$current"
+        return 0
+        ;;
+      1|1min|1m)
+        printf '%s\n' "1min"
+        return 0
+        ;;
+      2|5min|5m)
+        printf '%s\n' "5min"
+        return 0
+        ;;
+      3|15min|15m)
+        printf '%s\n' "15min"
+        return 0
+        ;;
+      4|1h|1hour|hour)
+        printf '%s\n' "1h"
+        return 0
+        ;;
+      5|custom)
+        while true; do
+          custom_value="$(prompt_text "Custom accuracy window [$current]: ")"
+          [ -n "$custom_value" ] || custom_value="$current"
+
+          if ! validate_systemd_timespan_value "$custom_value"; then
+            warn "That is not a valid systemd time span."
+            warn "Examples: 30s, 1min, 5min, 1h"
+            continue
+          fi
+
+          show_systemd_timespan_preview "$custom_value"
+          printf '%s\n' "$custom_value"
+          return 0
+        done
+        ;;
+      *)
+        warn "Choose 1, 2, 3, 4, or 5."
+        ;;
+    esac
+  done
+}
+
+prompt_restic_duration_interactive() {
+  local prompt_label="$1"
+  local default_value="${2:-3m}"
+  local duration=""
+
+  while true; do
+    printf 'Examples: 7d, 1m, 3m, 1y6m, 14d12h\n' >&2
+    duration="$(prompt_text "$prompt_label [$default_value]: ")"
+    [ -n "$duration" ] || duration="$default_value"
+
+    case "$duration" in
+      *[[:space:]]*)
+        warn "Do not use spaces in the duration."
+        ;;
+      *)
+        printf '%s\n' "$duration"
+        return 0
+        ;;
+    esac
+  done
+}
+
+preview_retention_summary() {
+  local description="$1"
+  local flags="$2"
+
+  printf '\nRetention summary\n' >&2
+  printf '%s\n' '-----------------' >&2
+  printf 'Result:      %s\n' "$description" >&2
+  printf 'Restic args: %s\n' "$flags" >&2
+}
+
+configure_retention_interactive() {
+  local retention_result="" retention_description="" retention_args=""
+
+  ensure_cli_backup_config || return 1
+  backup_config_defaults_loaded || return 1
+
+  retention_result="$(prompt_retention_policy_interactive "$BACKUP_RETENTION_DESCRIPTION" "$BACKUP_RETENTION_ARGS")" || return 1
+  IFS=$'\t' read -r retention_description retention_args <<< "$retention_result"
+
+  save_backup_settings \
+    "$BACKUP_SCHEDULE_MODE" \
+    "$BACKUP_ON_CALENDAR" \
+    "$BACKUP_PERSISTENT" \
+    "$BACKUP_ACCURACY_SEC" \
+    "$BACKUP_SCHEDULE_DESCRIPTION" \
+    "$retention_description" \
+    "$retention_args"
+}
+
+run_retention_dry_run_interactive() {
+  local source="$1"
+  local retention_args="$2"
+  local -a retention_argv=()
+
+  case "$source" in
+    local)
+      if ! local_restic_repository_exists; then
+        warn "Local repository is not ready yet, so a dry-run preview cannot be shown."
+        return 1
+      fi
+      ;;
+    cloud)
+      ensure_cloud_access_interactive || return 1
+      ;;
+  esac
+
+  load_restic_config "$source" || return 1
+  clear_stale_restic_locks_if_any
+  backup_retention_args_as_array "$retention_args" || {
+    warn "Could not parse the generated retention flags."
+    return 1
+  }
+  retention_argv=("${BACKUP_RETENTION_ARGV[@]}")
+
+  info "Dry-run preview for the $source repository"
+  restic_cmd forget --dry-run --tag "$PAWKUP_TAG" "${retention_argv[@]}"
+}
+
+prompt_retention_policy_interactive() {
+  local current_description="$1"
+  local current_args="$2"
+  local choice="" unit="" duration="" count="" description="" args=""
+  local preview_source="" default_unit="weekly"
+
+  while true; do
+    printf 'How do you want to keep old backups?\n' >&2
+    printf '  1. Keep all backups for a time period\n' >&2
+    printf '     Example: keep everything from the last 3 months\n' >&2
+    printf '  2. Keep one backup per day/week/month/year for a time period\n' >&2
+    printf '     Example: keep one weekly restore point for the last 3 months\n' >&2
+    printf '  3. Keep a fixed number of backups\n' >&2
+    printf '     Example: keep the last 12 weekly restore points\n' >&2
+    printf '  4. Advanced / enter raw restic flags\n' >&2
+
+    choice="$(prompt_text "Choose retention style [$current_description]: ")"
+    case "$choice" in
+      "")
+        printf '%s\t%s\n' "$current_description" "$current_args"
+        return 0
+        ;;
+      1)
+        duration="$(prompt_restic_duration_interactive 'Keep all backups newer than' '3m')" || return 1
+        description="Keep all backups for the last $duration"
+        args="--keep-within $duration"
+        ;;
+      2)
+        unit="$(prompt_retention_period_unit_interactive "$default_unit")" || return 1
+        duration="$(prompt_restic_duration_interactive 'For how long' '3m')" || return 1
+        case "$unit" in
+          hourly) description="Keep one hourly restore point for the last $duration" ;;
+          daily) description="Keep one daily restore point for the last $duration" ;;
+          weekly) description="Keep one weekly restore point for the last $duration" ;;
+          monthly) description="Keep one monthly restore point for the last $duration" ;;
+          yearly) description="Keep one yearly restore point for the last $duration" ;;
+        esac
+        args="--keep-within-$unit $duration"
+        ;;
+      3)
+        unit="$(prompt_retention_period_unit_interactive "$default_unit")" || return 1
+        count="$(prompt_text "How many $unit restore points should be kept [12]: ")"
+        [ -n "$count" ] || count="12"
+        case "$count" in
+          *[!0-9]*|"")
+            warn "Enter a whole number."
+            continue
+            ;;
+        esac
+        description="Keep the last $count $unit restore points"
+        args="--keep-$unit $count"
+        ;;
+      4)
+        description="$(prompt_text "Short retention summary [$current_description]: ")"
+        [ -n "$description" ] || description="$current_description"
+        printf 'Examples:\n' >&2
+        printf '  --keep-within 3m\n' >&2
+        printf '  --keep-within-weekly 3m\n' >&2
+        printf '  --keep-weekly 12\n' >&2
+        args="$(prompt_text "Raw restic forget flags [$current_args]: ")"
+        [ -n "$args" ] || args="$current_args"
+        ;;
+      *)
+        warn "Choose 1, 2, 3, or 4."
+        continue
+        ;;
+    esac
+
+    preview_retention_summary "$description" "$args"
+    if prompt_yes_no "Run a dry-run retention preview now?" "y"; then
+      printf 'Preview which repository?\n' >&2
+      printf '  1. Local\n' >&2
+      printf '  2. Cloud\n' >&2
+      case "$(prompt_text 'Choose preview source [1]: ')" in
+        ""|1|local)
+          preview_source="local"
+          ;;
+        2|cloud)
+          preview_source="cloud"
+          ;;
+        *)
+          warn "Choose 1 or 2."
+          continue
+          ;;
+      esac
+      run_retention_dry_run_interactive "$preview_source" "$args" >&2 || true
+    fi
+
+    if prompt_yes_no "Use this retention setup?" "y"; then
+      printf '%s\t%s\n' "$description" "$args"
+      return 0
+    fi
+  done
+}
+
+configure_backup_schedule_interactive() {
+  local mode="" on_calendar="" persistent="" accuracy_sec="" description=""
+  local frequency_result=""
+
+  ensure_cli_backup_config || return 1
+  backup_config_defaults_loaded || return 1
+  ensure_restic_password_interactive || return 1
+
+  mode="$(prompt_backup_mode_interactive "$BACKUP_SCHEDULE_MODE")" || return 1
+  if [ "$mode" != "local-only" ]; then
+    ensure_cloud_access_interactive || return 1
+  fi
+
+  frequency_result="$(prompt_schedule_frequency_interactive "$BACKUP_ON_CALENDAR" "$BACKUP_SCHEDULE_DESCRIPTION")" || return 1
+  IFS=$'\t' read -r on_calendar description <<< "$frequency_result"
+
+  if prompt_yes_no "Catch up missed runs after the laptop is back on?" "$( [ "$BACKUP_PERSISTENT" = "true" ] && printf 'y' || printf 'n' )"; then
+    persistent="true"
+  else
+    persistent="false"
+  fi
+
+  accuracy_sec="$(prompt_accuracy_window_interactive "$BACKUP_ACCURACY_SEC")" || return 1
+
+  save_backup_settings \
+    "$mode" \
+    "$on_calendar" \
+    "$persistent" \
+    "$accuracy_sec" \
+    "$description" \
+    "$BACKUP_RETENTION_DESCRIPTION" \
+    "$BACKUP_RETENTION_ARGS" || return 1
+
+  apply_backup_schedule
+}
+
+run_backup_command() {
+  local mode="$1"
+  local dry_run="${2:-false}"
+  local mode_label=""
+  local -a args=()
+
+  case "$mode" in
+    local-only) mode_label="local" ;;
+    cloud-only) mode_label="cloud" ;;
+    all) mode_label="local and cloud" ;;
+    *) mode_label="$mode" ;;
+  esac
+
+  if [ "$dry_run" = "true" ]; then
+    printf 'Previewing the %s backup.\n' "$mode_label"
+  else
+    printf 'Starting the %s backup.\n' "$mode_label"
+  fi
+  printf 'Live output will appear below while the backup is running.\n'
+
+  args=("--$mode")
+  if [ "$dry_run" = "true" ]; then
+    args=("--dry-run" "${args[@]}")
+  fi
+
+  if ! "$PAWKUP_LIBEXEC_DIR/pawkup_backup" "${args[@]}"; then
+    warn "The backup command did not finish successfully."
+    return 1
+  fi
+}
+
+run_check_command() {
+  local source="$1"
+
+  if ! "$PAWKUP_LIBEXEC_DIR/pawkup_check" --source "$source"; then
+    warn "The repository health check did not finish successfully."
+    return 1
+  fi
+}
+
+run_restore_command() {
+  local source="$1"
+  shift
+
+  if ! "$PAWKUP_LIBEXEC_DIR/pawkup_restore" --source "$source" "$@"; then
+    warn "The restore command did not finish successfully."
+    return 1
+  fi
+}
+
+show_main_menu() {
+  local show_summary="${1:-false}"
+
+  printf '\nPawkup\n'
+  printf '%s\n' '------'
+  if [ "$show_summary" = "true" ]; then
+    show_backup_config_summary
+    printf '\n'
+  fi
+  printf '1. Run backup now\n'
+  printf '2. Restore\n'
+  printf '3. Backup setup and cloud auth\n'
+  printf '4. Edit include paths\n'
+  printf '5. Edit exclude paths\n'
+  printf '6. Backup schedule\n'
+  printf '7. Quit\n'
+}
+
+backup_menu() {
+  while true; do
+    printf '\nBackup\n'
+    printf '%s\n' '------'
+    printf '1. Run local backup now\n'
+    printf '2. Run cloud backup now\n'
+    printf '3. Run local and cloud backup now\n'
+    printf '4. Preview local backup dry-run\n'
+    printf '5. Preview cloud backup dry-run\n'
+    printf '6. Preview local and cloud backup dry-run\n'
+    printf '7. Check cloud access\n'
+    printf '8. Check local repository health\n'
+    printf '9. Check cloud repository health\n'
+    printf '10. Clear stale local repo locks\n'
+    printf '11. Clear stale cloud repo locks\n'
+    printf '12. Back\n'
+    printf '13. Quit\n'
+
+    case "$(prompt_text 'Choose an option: ')" in
+      1)
+        run_backup_command "local-only" || true
+        ;;
+      2)
+        run_backup_command "cloud-only" || true
+        ;;
+      3)
+        run_backup_command "all" || true
+        ;;
+      4)
+        run_backup_command "local-only" "true" || true
+        ;;
+      5)
+        run_backup_command "cloud-only" "true" || true
+        ;;
+      6)
+        run_backup_command "all" "true" || true
+        ;;
+      7)
+        ensure_cloud_access_interactive || true
+        ;;
+      8)
+        run_check_command local || true
+        ;;
+      9)
+        run_check_command cloud || true
+        ;;
+      10)
+        unlock_stale_restic_locks_interactive local || true
+        ;;
+      11)
+        unlock_stale_restic_locks_interactive cloud || true
+        ;;
+      12|b|back)
+        return 0
+        ;;
+      13|q|quit)
+        exit 0
+        ;;
+      *)
+        warn "Choose 1 to 13."
+        ;;
+    esac
+  done
+}
+
+restore_menu() {
+  while true; do
+    printf '\nRestore\n'
+    printf '%s\n' '-------'
+    printf '1. Restore from local\n'
+    printf '2. Restore from cloud\n'
+    printf '3. Back\n'
+    printf '4. Quit\n'
+
+    case "$(prompt_text 'Choose an option: ')" in
+      1)
+        run_restore_command local || true
+        ;;
+      2)
+        run_restore_command cloud || true
+        ;;
+      3|b|back)
+        return 0
+        ;;
+      4|q|quit)
+        exit 0
+        ;;
+      *)
+        warn "Choose 1 to 4."
+        ;;
+    esac
+  done
+}
+
+config_menu() {
+  while true; do
+    printf '\nBackup Setup And Cloud Auth\n'
+    printf '%s\n' '----------------------------'
+    show_backup_config_summary
+    printf '\n'
+    printf '1. Repair or create missing setup files\n'
+    printf '2. Change repository folder name\n'
+    printf '3. Change cloud remote name\n'
+    printf '4. Rotate repo password\n'
+    printf '5. Configure retention policy\n'
+    printf '6. Check cloud access\n'
+    printf '7. Open rclone config\n'
+    printf '8. Refresh rclone auth\n'
+    printf '9. Open backup config in editor\n'
+    printf '10. Show file locations\n'
+    printf '11. Back\n'
+    printf '12. Quit\n'
+
+    case "$(prompt_text 'Choose an option: ')" in
+      1)
+        repair_backup_setup_interactive || true
+        ;;
+      2)
+        change_repository_name_interactive || true
+        ;;
+      3)
+        change_cloud_remote_interactive || true
+        ;;
+      4)
+        replace_restic_password_interactive || true
+        ;;
+      5)
+        configure_retention_interactive || true
+        ;;
+      6)
+        ensure_cloud_access_interactive || true
+        ;;
+      7)
+        open_rclone_config_interactive || true
+        ;;
+      8)
+        reconnect_rclone_auth_interactive || true
+        ;;
+      9)
+        if ensure_cli_backup_config; then
+          open_file_in_editor "$PAWKUP_ENV_FILE" || true
+        fi
+        ;;
+      10)
+        ensure_cli_backup_config || true
+        show_backup_file_locations
+        ;;
+      11|b|back)
+        return 0
+        ;;
+      12|q|quit)
+        exit 0
+        ;;
+      *)
+        warn "Choose 1 to 12."
+        ;;
+    esac
+  done
+}
+
+path_menu() {
+  local kind="$1"
+  local label=""
+
+  label="$(path_kind_label "$kind")" || return 1
+
+  while true; do
+    printf '\n%s Paths\n' "${label^}"
+    printf '%s\n' "$(printf '%0.s-' $(seq 1 $((${#label} + 6))))"
+    show_path_entries_menu_text "$kind" || true
+    printf '\n'
+    printf '1. Add path\n'
+    printf '2. Remove path\n'
+    printf '3. Open file in editor\n'
+    if [ "$kind" = "exclude" ]; then
+      printf '4. Add recommended cache/build excludes\n'
+      printf '5. Back\n'
+      printf '6. Quit\n'
+    else
+      printf '4. Back\n'
+      printf '5. Quit\n'
+    fi
+
+    case "$(prompt_text 'Choose an option: ')" in
+      1)
+        add_path_entry_interactive "$kind" || true
+        ;;
+      2)
+        remove_path_entry_interactive "$kind" || true
+        ;;
+      3)
+        edit_path_file_in_editor "$kind" || true
+        ;;
+      4)
+        if [ "$kind" = "exclude" ]; then
+          add_recommended_exclude_presets_interactive || true
+        else
+          return 0
+        fi
+        ;;
+      5)
+        if [ "$kind" = "exclude" ]; then
+          return 0
+        fi
+        exit 0
+        ;;
+      6)
+        if [ "$kind" = "exclude" ]; then
+          exit 0
+        fi
+        warn "Choose 1 to 5."
+        ;;
+      b|back)
+        return 0
+        ;;
+      q|quit)
+        exit 0
+        ;;
+      *)
+        if [ "$kind" = "exclude" ]; then
+          warn "Choose 1 to 6."
+        else
+          warn "Choose 1 to 5."
+        fi
+        ;;
+    esac
+  done
+}
+
+scheduler_menu() {
+  while true; do
+    printf '\nBackup Schedule\n'
+    printf '%s\n' '---------------'
+    show_scheduler_status_with_spacing
+    printf '\n'
+    printf 'Retention is configured from "Backup setup and cloud auth".\n'
+    printf '\n'
+    printf '1. Create or update schedule\n'
+    printf '2. Run scheduled backup now\n'
+    printf '3. Pause schedule\n'
+    printf '4. Resume schedule\n'
+    printf '5. Delete schedule\n'
+    printf '6. Back\n'
+    printf '7. Quit\n'
+
+    case "$(prompt_text 'Choose an option: ')" in
+      1)
+        configure_backup_schedule_interactive || true
+        ;;
+      2)
+        run_backup_schedule_now || true
+        ;;
+      3)
+        pause_backup_schedule || true
+        ;;
+      4)
+        resume_backup_schedule || true
+        ;;
+      5)
+        delete_backup_schedule || true
+        ;;
+      6|b|back)
+        return 0
+        ;;
+      7|q|quit)
+        exit 0
+        ;;
+      *)
+        warn "Choose 1 to 7."
+        ;;
+    esac
+  done
+}
+
+interactive_main() {
+  local first_screen="true"
+
+  ensure_interactive_tty
+
+  while true; do
+    show_main_menu "$first_screen"
+    first_screen="false"
+
+    case "$(prompt_text 'Choose an option: ')" in
+      1)
+        backup_menu
+        ;;
+      2)
+        restore_menu
+        ;;
+      3)
+        config_menu
+        ;;
+      4)
+        path_menu include
+        ;;
+      5)
+        path_menu exclude
+        ;;
+      6)
+        scheduler_menu
+        ;;
+      7|q|quit)
+        exit 0
+        ;;
+      *)
+        warn "Choose 1 to 7."
+        ;;
+    esac
+  done
+}
+
+main() {
+  ensure_pawkup_not_running_as_root
+
+  if [ "$#" -eq 0 ]; then
+    interactive_main
+    exit 0
+  fi
+
+  case "$1" in
+    backup)
+      shift
+      exec "$PAWKUP_LIBEXEC_DIR/pawkup_backup" "$@"
+      ;;
+    restore)
+      shift
+      exec "$PAWKUP_LIBEXEC_DIR/pawkup_restore" "$@"
+      ;;
+    check)
+      shift
+      exec "$PAWKUP_LIBEXEC_DIR/pawkup_check" "$@"
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      warn "Unknown pawkup command: $1"
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

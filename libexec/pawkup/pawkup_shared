@@ -1,0 +1,2107 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2034,SC2088
+set -uo pipefail
+
+PAWKUP_SCRIPT_DIR="${PAWKUP_LIBEXEC_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+PAWKUP_COMMAND_PATH="${PAWKUP_COMMAND_PATH:-}"
+PAWKUP_TITLE="Pawkup"
+PAWKUP_HOME="$HOME"
+
+if [ -z "$PAWKUP_COMMAND_PATH" ]; then
+  if [ -x "$PAWKUP_SCRIPT_DIR/../../bin/pawkup" ]; then
+    PAWKUP_COMMAND_PATH="$(cd "$PAWKUP_SCRIPT_DIR/../.." && pwd)/bin/pawkup"
+  else
+    PAWKUP_COMMAND_PATH="$(command -v pawkup || true)"
+  fi
+fi
+
+PAWKUP_DEFAULT_REPOSITORY_NAME="pawkup"
+PAWKUP_BACKUP_DIR="$PAWKUP_HOME/$PAWKUP_DEFAULT_REPOSITORY_NAME"
+PAWKUP_CONFIG_DIR="$PAWKUP_HOME/.config/pawkup"
+PAWKUP_ENV_FILE="$PAWKUP_CONFIG_DIR/backup.env"
+PAWKUP_PASSWORD_FILE="$PAWKUP_CONFIG_DIR/restic-password"
+PAWKUP_INCLUDE_PATHS_FILE="$PAWKUP_CONFIG_DIR/include-paths.txt"
+PAWKUP_EXCLUDE_PATHS_FILE="$PAWKUP_CONFIG_DIR/exclude-paths.txt"
+PAWKUP_RCLONE_CONFIG="$PAWKUP_HOME/.config/rclone/rclone.conf"
+PAWKUP_STATE_DIR="$PAWKUP_HOME/.local/state/pawkup"
+PAWKUP_LOG_DIR="$PAWKUP_STATE_DIR/logs"
+PAWKUP_OPERATION_LOCK_FILE="$PAWKUP_STATE_DIR/operation.lock"
+PAWKUP_OPERATION_NAME_FILE="$PAWKUP_STATE_DIR/current-operation.txt"
+PAWKUP_REINSTALL_STATE_FILE="$PAWKUP_STATE_DIR/reinstall.state"
+PAWKUP_RESTORE_STAGING_DIR="$PAWKUP_STATE_DIR/restore-staging"
+PAWKUP_TAG="pawkup"
+PAWKUP_RESTIC_RETRY_LOCK="${PAWKUP_RESTIC_RETRY_LOCK:-5m}"
+PAWKUP_BACKUP_SERVICE_NAME="pawkup-backup.service"
+PAWKUP_BACKUP_TIMER_NAME="pawkup-backup.timer"
+PAWKUP_USER_SYSTEMD_DIR="$PAWKUP_HOME/.config/systemd/user"
+PAWKUP_BACKUP_SERVICE_FILE="$PAWKUP_USER_SYSTEMD_DIR/$PAWKUP_BACKUP_SERVICE_NAME"
+PAWKUP_BACKUP_TIMER_FILE="$PAWKUP_USER_SYSTEMD_DIR/$PAWKUP_BACKUP_TIMER_NAME"
+
+info() {
+  printf '\n==> %s\n' "$1"
+}
+
+warn() {
+  printf 'Warning: %s\n' "$1" >&2
+}
+
+success() {
+  printf '%s\n' "$1"
+}
+
+ensure_pawkup_not_running_as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    warn "Run 'pawkup' as your normal user, not root."
+    exit 1
+  fi
+}
+
+can_use_systemd_inhibit() {
+  command -v systemd-inhibit >/dev/null 2>&1 || return 1
+  systemd-inhibit --what=sleep:shutdown --why="Pawkup probe" true >/dev/null 2>&1
+}
+
+maybe_reexec_with_systemd_inhibit() {
+  local reason="$1"
+  shift
+
+  if [ "${PAWKUP_INHIBITED:-0}" = "1" ]; then
+    return 0
+  fi
+
+  if ! can_use_systemd_inhibit; then
+    return 0
+  fi
+
+  info "Preventing sleep and shutdown while $reason"
+  exec env PAWKUP_INHIBITED=1 \
+    systemd-inhibit \
+      --what=sleep:shutdown \
+      --who="$PAWKUP_TITLE" \
+      --why="$reason" \
+      "$@"
+}
+
+acquire_operation_lock() {
+  local operation_name="$1"
+  local active_operation=""
+
+  if [ "${PAWKUP_OPERATION_LOCK_HELD:-0}" = "1" ]; then
+    return 0
+  fi
+
+  mkdir -p "$PAWKUP_STATE_DIR"
+  exec 201>"$PAWKUP_OPERATION_LOCK_FILE"
+  if ! flock -n 201; then
+    if [ -f "$PAWKUP_OPERATION_NAME_FILE" ]; then
+      active_operation="$(tr -d '\r\n' < "$PAWKUP_OPERATION_NAME_FILE")"
+    fi
+
+    if [ -n "$active_operation" ]; then
+      warn "Another pawkup task is already running: $active_operation"
+    else
+      warn "Another pawkup task is already running."
+    fi
+    exec 201>&-
+    return 1
+  fi
+
+  printf '%s\n' "$operation_name" > "$PAWKUP_OPERATION_NAME_FILE"
+  export PAWKUP_OPERATION_LOCK_HELD="1"
+}
+
+release_operation_lock() {
+  if [ "${PAWKUP_OPERATION_LOCK_HELD:-0}" != "1" ]; then
+    return 0
+  fi
+
+  rm -f "$PAWKUP_OPERATION_NAME_FILE" >/dev/null 2>&1 || true
+  flock -u 201 >/dev/null 2>&1 || true
+  exec 201>&- 2>/dev/null || true
+  unset PAWKUP_OPERATION_LOCK_HELD
+}
+
+start_failure_log_capture() {
+  local prefix="$1"
+
+  if [ "${PAWKUP_ERROR_CAPTURE_ACTIVE:-0}" = "1" ]; then
+    return 0
+  fi
+
+  PAWKUP_ERROR_CAPTURE_PREFIX="$prefix"
+  PAWKUP_ERROR_CAPTURE_TMP="$(mktemp "${TMPDIR:-/tmp}/${prefix}-error.XXXXXX.tmp")"
+  export PAWKUP_ERROR_CAPTURE_ACTIVE="1"
+  exec > >(tee -a "$PAWKUP_ERROR_CAPTURE_TMP") 2>&1
+}
+
+finalize_error_capture() {
+  local status="$1"
+  local final_log=""
+
+  if [ "${PAWKUP_ERROR_CAPTURE_ACTIVE:-0}" != "1" ]; then
+    return 0
+  fi
+
+  if [ -n "${PAWKUP_ERROR_CAPTURE_TMP:-}" ] && [ -f "$PAWKUP_ERROR_CAPTURE_TMP" ]; then
+    if [ "$status" -ne 0 ]; then
+      mkdir -p "$PAWKUP_LOG_DIR"
+      final_log="$PAWKUP_LOG_DIR/${PAWKUP_ERROR_CAPTURE_PREFIX}-error-$(date +%F_%H-%M-%S).log"
+      mv "$PAWKUP_ERROR_CAPTURE_TMP" "$final_log"
+      printf 'Error log saved to %s\n' "$final_log" >&2
+    else
+      rm -f "$PAWKUP_ERROR_CAPTURE_TMP"
+    fi
+  fi
+
+  unset PAWKUP_ERROR_CAPTURE_ACTIVE
+  unset PAWKUP_ERROR_CAPTURE_PREFIX
+  unset PAWKUP_ERROR_CAPTURE_TMP
+}
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+pause_for_enter() {
+  local prompt="${1:-Press Enter to continue.}"
+  read -r -p "$prompt" _
+}
+
+prompt_text() {
+  local prompt="$1"
+  local input=""
+  read -r -p "$prompt" input
+  trim "$input"
+}
+
+prompt_yes_no() {
+  local prompt="$1"
+  local default="${2:-y}"
+  local answer=""
+
+  while true; do
+    if [ "$default" = "n" ]; then
+      read -r -p "$prompt [y/N] " answer
+    else
+      read -r -p "$prompt [Y/n] " answer
+    fi
+
+    answer="$(trim "$answer")"
+    if [ -z "$answer" ]; then
+      answer="$default"
+    fi
+
+    case "${answer,,}" in
+      y|yes)
+        return 0
+        ;;
+      n|no)
+        return 1
+        ;;
+      *)
+        warn "Please answer yes or no."
+        ;;
+    esac
+  done
+}
+
+prompt_hidden_value() {
+  local prompt="$1"
+  local value=""
+
+  read -r -s -p "$prompt" value
+  printf '\n' >&2
+  trim "$value"
+}
+
+format_duration() {
+  local total_seconds="$1"
+  local hours minutes seconds
+
+  hours=$((total_seconds / 3600))
+  minutes=$(((total_seconds % 3600) / 60))
+  seconds=$((total_seconds % 60))
+
+  if [ "$hours" -gt 0 ]; then
+    printf '%02dh:%02dm:%02ds' "$hours" "$minutes" "$seconds"
+  else
+    printf '%02dm:%02ds' "$minutes" "$seconds"
+  fi
+}
+
+run_with_heartbeat() {
+  local label="$1"
+  shift
+  local start_time=$SECONDS
+  local pid status
+
+  "$@" &
+  pid=$!
+
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 5
+    if kill -0 "$pid" 2>/dev/null; then
+      printf '... %s (%s elapsed)\n' "$label" "$(format_duration "$((SECONDS - start_time))")"
+    fi
+  done
+
+  wait "$pid"
+  status=$?
+  return "$status"
+}
+
+download() {
+  local url="$1"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url"
+  else
+    warn "Need curl for this step."
+    return 1
+  fi
+}
+
+detect_rclone_remote() {
+  local first_remote=""
+
+  if [ -f "$PAWKUP_RCLONE_CONFIG" ]; then
+    if grep -q '^\[gdrive\]$' "$PAWKUP_RCLONE_CONFIG"; then
+      printf '%s\n' "gdrive"
+      return
+    fi
+
+    first_remote="$(sed -n 's/^\[\([^]]\+\)\]$/\1/p' "$PAWKUP_RCLONE_CONFIG" | head -n 1)"
+    if [ -n "$first_remote" ]; then
+      printf '%s\n' "$first_remote"
+      return
+    fi
+  fi
+
+  printf '%s\n' "gdrive"
+}
+
+default_local_restic_repository() {
+  local repository_name="${1:-$PAWKUP_DEFAULT_REPOSITORY_NAME}"
+  printf '%s\n' "$PAWKUP_HOME/$repository_name"
+}
+
+default_cloud_restic_repository() {
+  local remote_name="${1:-$(detect_rclone_remote)}"
+  local repository_name="${2:-$PAWKUP_DEFAULT_REPOSITORY_NAME}"
+  printf 'rclone:%s:%s\n' "$remote_name" "$repository_name"
+}
+
+backup_config_exists() {
+  [ -f "$PAWKUP_ENV_FILE" ]
+}
+
+backup_repository_name_is_valid() {
+  local repository_name
+
+  repository_name="$(trim "$1")"
+  [ -n "$repository_name" ] || return 1
+
+  case "$repository_name" in
+    "."|".."|*/*|*:* )
+      return 1
+      ;;
+  esac
+
+  return 0
+}
+
+write_backup_config_file() {
+  local repository_name="$1"
+  local local_repository="$2"
+  local cloud_repository="$3"
+  local password_file="$4"
+  local schedule_mode="${5:-cloud-only}"
+  local on_calendar="${6:-weekly}"
+  local persistent="${7:-true}"
+  local accuracy_sec="${8:-1min}"
+  local schedule_description="${9:-Weekly}"
+  local retention_description="${10:-Keep weekly restore points for the last 3 months}"
+  local retention_args="${11:---keep-within-weekly 3m}"
+
+  cat > "$PAWKUP_ENV_FILE" <<EOF
+# Pawkup backup settings
+#
+# You can edit this file directly if you prefer config files over the CLI.
+# The interactive 'pawkup' app writes the same values for you.
+#
+# BACKUP_REPOSITORY_NAME is the folder name used for both local and cloud repos.
+# Changing it later means moving or recreating your repositories.
+BACKUP_REPOSITORY_NAME="$repository_name"
+
+# Local restic repository path.
+LOCAL_RESTIC_REPOSITORY="$local_repository"
+
+# Cloud restic repository path in rclone form: rclone:REMOTE:FOLDER
+CLOUD_RESTIC_REPOSITORY="$cloud_repository"
+
+# Restic password file. Keep this secret.
+RESTIC_PASSWORD_FILE="$password_file"
+
+# Scheduled backup mode:
+#   local-only
+#   cloud-only
+#   all
+BACKUP_SCHEDULE_MODE="$schedule_mode"
+
+# systemd timer calendar expression.
+# Examples:
+#   hourly
+#   daily
+#   weekly
+#   monthly
+#   Mon *-*-* 00:00:00
+BACKUP_ON_CALENDAR="$on_calendar"
+
+# Catch up missed runs when the machine comes back online:
+#   true
+#   false
+BACKUP_PERSISTENT="$(normalize_bool_string "$persistent")"
+
+# systemd timer accuracy window, for example:
+#   1min
+#   5min
+BACKUP_ACCURACY_SEC="$accuracy_sec"
+
+# Short human label shown in the CLI, for example:
+#   Weekly
+#   Every day at 18:00
+BACKUP_SCHEDULE_DESCRIPTION="$schedule_description"
+
+# Human-friendly retention summary shown in the CLI.
+BACKUP_RETENTION_DESCRIPTION="$retention_description"
+
+# Raw restic forget flags used after each backup.
+# Examples:
+#   --keep-within 3m
+#   --keep-within-weekly 3m
+#   --keep-weekly 12
+#   --keep-last 10
+  BACKUP_RETENTION_ARGS="$retention_args"
+EOF
+  chmod 600 "$PAWKUP_ENV_FILE"
+}
+
+write_backup_readme_file() {
+  local readme_path="$PAWKUP_CONFIG_DIR/README.txt"
+
+  cat > "$readme_path" <<EOF
+Pawkup uses restic with your configured local and cloud repositories.
+
+Main entry:
+  pawkup
+
+You can do setup either in the interactive CLI or by editing these files directly:
+  $PAWKUP_ENV_FILE
+  $PAWKUP_INCLUDE_PATHS_FILE
+  $PAWKUP_EXCLUDE_PATHS_FILE
+
+Before the first cloud backup, make sure:
+1. A strong repository password exists in:
+   $PAWKUP_PASSWORD_FILE
+2. The rclone remote referenced in:
+   $PAWKUP_ENV_FILE
+   is authorized and working.
+3. Your include paths file has at least one active entry.
+
+The repository is initialized automatically on the first successful run.
+Use these commands:
+  pawkup
+  pawkup backup
+  pawkup backup --dry-run
+  pawkup check
+  pawkup restore
+  reinstall
+
+Backup path selection lives in:
+  $PAWKUP_INCLUDE_PATHS_FILE
+  $PAWKUP_EXCLUDE_PATHS_FILE
+
+Relative paths are under $PAWKUP_HOME.
+Absolute paths stay absolute.
+Wildcard includes are expanded to matching paths before backup.
+Wildcard excludes use restic pattern matching; example:
+  **/node_modules
+The local restic repository is automatically excluded when it overlaps your includes.
+Stage /etc or /var restores before writing live paths.
+EOF
+  chmod 600 "$readme_path"
+}
+
+write_backup_path_files() {
+  if [ ! -f "$PAWKUP_INCLUDE_PATHS_FILE" ]; then
+    cat > "$PAWKUP_INCLUDE_PATHS_FILE" <<EOF
+# One path per line.
+# Relative paths are under $PAWKUP_HOME.
+# Absolute paths stay absolute.
+# Wildcards are expanded to matching paths before backup.
+# Examples:
+#   .
+#   .bashrc
+#   ~/Documents
+#   ~/Projects/*
+#   /etc/ssh
+
+# Default: back up your whole home folder.
+.
+EOF
+    chmod 600 "$PAWKUP_INCLUDE_PATHS_FILE"
+  fi
+
+  if [ ! -f "$PAWKUP_EXCLUDE_PATHS_FILE" ]; then
+    cat > "$PAWKUP_EXCLUDE_PATHS_FILE" <<EOF
+# One path per line.
+# Relative paths are under $PAWKUP_HOME.
+# Absolute paths stay absolute.
+# Wildcards use restic pattern matching.
+# Example: **/node_modules excludes every node_modules directory under $PAWKUP_HOME.
+EOF
+    chmod 600 "$PAWKUP_EXCLUDE_PATHS_FILE"
+  fi
+}
+
+ensure_backup_config_template() {
+  local remote_name="${1:-}"
+  local repository_name="${2:-$PAWKUP_DEFAULT_REPOSITORY_NAME}"
+
+  if [ -z "$remote_name" ]; then
+    remote_name="$(detect_rclone_remote)"
+  fi
+
+  if ! backup_repository_name_is_valid "$repository_name"; then
+    repository_name="$PAWKUP_DEFAULT_REPOSITORY_NAME"
+  fi
+
+  mkdir -p "$PAWKUP_CONFIG_DIR"
+  chmod 700 "$PAWKUP_CONFIG_DIR"
+
+  if [ ! -f "$PAWKUP_ENV_FILE" ]; then
+    write_backup_config_file \
+      "$repository_name" \
+      "$(default_local_restic_repository "$repository_name")" \
+      "$(default_cloud_restic_repository "$remote_name" "$repository_name")" \
+      "$PAWKUP_PASSWORD_FILE"
+    success "Backup config created at $PAWKUP_ENV_FILE"
+  fi
+
+  write_backup_path_files
+  write_backup_readme_file
+}
+
+prompt_backup_repository_name_interactive() {
+  local default_name="${1:-$PAWKUP_DEFAULT_REPOSITORY_NAME}"
+  local repository_name=""
+
+  while true; do
+    repository_name="$(prompt_text "Backup folder name [$default_name]: ")"
+    if [ -z "$repository_name" ]; then
+      repository_name="$default_name"
+    fi
+
+    if backup_repository_name_is_valid "$repository_name"; then
+      printf '%s\n' "$repository_name"
+      return 0
+    fi
+
+    warn "Use a single folder name without / or :"
+  done
+}
+
+ensure_backup_config_interactive_if_missing() {
+  local remote_name="" repository_name=""
+
+  if backup_config_exists; then
+    return 0
+  fi
+
+  remote_name="$(detect_rclone_remote)"
+
+  info "First-time backup setup"
+  printf 'Local and cloud backups will use the same repository folder name.\n'
+  printf 'Default name: %s\n' "$PAWKUP_DEFAULT_REPOSITORY_NAME"
+  printf 'Changing it later means moving the repository, so it is best to pick it now.\n'
+
+  repository_name="$(prompt_backup_repository_name_interactive "$PAWKUP_DEFAULT_REPOSITORY_NAME")" || return 1
+  ensure_backup_config_template "$remote_name" "$repository_name"
+
+  success "Backup storage is configured."
+  printf 'Local repo: %s\n' "$(default_local_restic_repository "$repository_name")"
+  printf 'Cloud repo: %s\n' "$(default_cloud_restic_repository "$remote_name" "$repository_name")"
+}
+
+generate_random_password() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 48
+  else
+    tr -dc 'A-Za-z0-9!@#$%^&*()_+-=' </dev/urandom | head -c 48
+    printf '\n'
+  fi
+}
+
+write_secret_file() {
+  local path="$1"
+  local secret="$2"
+
+  mkdir -p "$(dirname "$path")"
+  umask 077
+  printf '%s\n' "$secret" > "$path"
+  chmod 600 "$path"
+}
+
+ensure_restic_password_interactive() {
+  local password=""
+  local confirm=""
+
+  mkdir -p "$PAWKUP_CONFIG_DIR"
+  chmod 700 "$PAWKUP_CONFIG_DIR"
+
+  if [ -f "$PAWKUP_PASSWORD_FILE" ]; then
+    success "Using existing repo password file at $PAWKUP_PASSWORD_FILE"
+    return 0
+  fi
+
+  info "No restic password file found."
+  printf 'The repo password will be stored at %s\n' "$PAWKUP_PASSWORD_FILE"
+
+  while true; do
+    printf '1. Generate a strong password automatically\n'
+    printf '2. Enter a custom password\n'
+    printf '3. Cancel\n'
+
+    case "$(prompt_text 'Choose an option: ')" in
+      1)
+        password="$(generate_random_password)"
+        write_secret_file "$PAWKUP_PASSWORD_FILE" "$password"
+        success "A strong password was generated and saved."
+        return 0
+        ;;
+      2)
+        password="$(prompt_hidden_value 'Enter new repo password: ')"
+        if [ -z "$password" ]; then
+          warn "Password cannot be empty."
+          continue
+        fi
+
+        confirm="$(prompt_hidden_value 'Confirm repo password: ')"
+        if [ "$password" != "$confirm" ]; then
+          warn "Passwords did not match."
+          continue
+        fi
+
+        write_secret_file "$PAWKUP_PASSWORD_FILE" "$password"
+        success "Custom password saved."
+        return 0
+        ;;
+      3)
+        warn "Password setup cancelled."
+        return 1
+        ;;
+      *)
+        warn "Please choose 1, 2, or 3."
+        ;;
+    esac
+  done
+}
+
+load_backup_settings() {
+  if [ ! -f "$PAWKUP_ENV_FILE" ]; then
+    warn "Backup config not found at $PAWKUP_ENV_FILE"
+    return 1
+  fi
+
+  unset \
+    BACKUP_REPOSITORY_NAME \
+    LOCAL_RESTIC_REPOSITORY \
+    CLOUD_RESTIC_REPOSITORY \
+    RESTIC_PASSWORD_FILE \
+    BACKUP_SCHEDULE_MODE \
+    BACKUP_ON_CALENDAR \
+    BACKUP_PERSISTENT \
+    BACKUP_ACCURACY_SEC \
+    BACKUP_SCHEDULE_DESCRIPTION \
+    BACKUP_RETENTION_DESCRIPTION \
+    BACKUP_RETENTION_ARGS
+
+  # shellcheck disable=SC1090
+  . "$PAWKUP_ENV_FILE"
+
+  BACKUP_REPOSITORY_NAME="${BACKUP_REPOSITORY_NAME:-$PAWKUP_DEFAULT_REPOSITORY_NAME}"
+  LOCAL_RESTIC_REPOSITORY="${LOCAL_RESTIC_REPOSITORY:-$(default_local_restic_repository "$BACKUP_REPOSITORY_NAME")}"
+  CLOUD_RESTIC_REPOSITORY="${CLOUD_RESTIC_REPOSITORY:-$(default_cloud_restic_repository "$(detect_rclone_remote)" "$BACKUP_REPOSITORY_NAME")}"
+  RESTIC_PASSWORD_FILE="${RESTIC_PASSWORD_FILE:-$PAWKUP_PASSWORD_FILE}"
+  BACKUP_SCHEDULE_MODE="${BACKUP_SCHEDULE_MODE:-cloud-only}"
+  BACKUP_ON_CALENDAR="${BACKUP_ON_CALENDAR:-weekly}"
+  BACKUP_PERSISTENT="${BACKUP_PERSISTENT:-true}"
+  BACKUP_ACCURACY_SEC="${BACKUP_ACCURACY_SEC:-1min}"
+  BACKUP_SCHEDULE_DESCRIPTION="${BACKUP_SCHEDULE_DESCRIPTION:-Weekly}"
+  BACKUP_RETENTION_DESCRIPTION="${BACKUP_RETENTION_DESCRIPTION:-$(default_backup_retention_description)}"
+  BACKUP_RETENTION_ARGS="${BACKUP_RETENTION_ARGS:-$(default_backup_retention_args)}"
+  return 0
+}
+
+load_restic_config() {
+  local source="${1:-cloud}"
+
+  load_backup_settings || return 1
+
+  case "$source" in
+    local)
+      RESTIC_REPOSITORY="$LOCAL_RESTIC_REPOSITORY"
+      ;;
+    cloud)
+      RESTIC_REPOSITORY="$CLOUD_RESTIC_REPOSITORY"
+      ;;
+    *)
+      warn "Unknown restic source: $source"
+      return 1
+      ;;
+  esac
+
+  : "${RESTIC_REPOSITORY:?RESTIC repository is not set in $PAWKUP_ENV_FILE}"
+
+  if [ ! -r "$RESTIC_PASSWORD_FILE" ]; then
+    warn "Repo password file not found at $RESTIC_PASSWORD_FILE"
+    return 1
+  fi
+
+  if ! command -v restic >/dev/null 2>&1; then
+    warn "restic is not installed."
+    return 1
+  fi
+
+  if [ "$source" = "cloud" ] && ! command -v rclone >/dev/null 2>&1; then
+    warn "rclone is not installed."
+    return 1
+  fi
+
+  if [ "$source" = "cloud" ]; then
+    export RCLONE_CONFIG="$PAWKUP_RCLONE_CONFIG"
+  else
+    unset RCLONE_CONFIG 2>/dev/null || true
+  fi
+
+  export RESTIC_REPOSITORY
+  export RESTIC_PASSWORD_FILE
+  return 0
+}
+
+restic_cmd() {
+  restic --retry-lock "$PAWKUP_RESTIC_RETRY_LOCK" "$@"
+}
+
+restic_cmd_with_password_file() {
+  local password_file="$1"
+  shift
+
+  RESTIC_PASSWORD_FILE="$password_file" restic --retry-lock "$PAWKUP_RESTIC_RETRY_LOCK" "$@"
+}
+
+clear_stale_restic_locks_if_any() {
+  restic unlock >/dev/null 2>&1 || true
+}
+
+unlock_stale_restic_locks_interactive() {
+  local source="${1:-cloud}"
+  local label="cloud"
+
+  case "$source" in
+    local) label="local" ;;
+    cloud) label="cloud" ;;
+    *)
+      warn "Unknown restic source: $source"
+      return 1
+      ;;
+  esac
+
+  load_restic_config "$source" || return 1
+
+  info "Checking the $label repository for stale locks"
+  if restic unlock; then
+    success "Stale restic locks were cleared if any existed."
+    return 0
+  fi
+
+  warn "Could not inspect or clear restic locks."
+  return 1
+}
+
+restic_repository_remote_name() {
+  local repository="$1"
+  local remote_part=""
+
+  case "$repository" in
+    rclone:*)
+      remote_part="${repository#rclone:}"
+      printf '%s\n' "${remote_part%%:*}"
+      ;;
+    *)
+      printf '%s\n' ""
+      ;;
+  esac
+}
+
+rclone_remote_exists() {
+  local remote_name="$1"
+
+  [ -n "$remote_name" ] || return 1
+  [ -f "$PAWKUP_RCLONE_CONFIG" ] || return 1
+  grep -q "^\[$remote_name\]$" "$PAWKUP_RCLONE_CONFIG"
+}
+
+verify_rclone_remote() {
+  local remote_name="$1"
+
+  [ -n "$remote_name" ] || return 1
+  rclone about "${remote_name}:" >/dev/null 2>&1
+}
+
+ensure_cloud_tools_installed_interactive() {
+  local missing=()
+
+  command -v restic >/dev/null 2>&1 || missing+=("restic")
+  command -v rclone >/dev/null 2>&1 || missing+=("rclone")
+
+  if [ "${#missing[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  warn "Missing required tool(s): ${missing[*]}"
+  warn "Install them first, then try again."
+  return 1
+}
+
+configure_rclone_auth_interactive() {
+  local remote_name="$1"
+
+  if rclone_remote_exists "$remote_name"; then
+    info "Refreshing rclone auth for '$remote_name'"
+    rclone config reconnect "$remote_name"
+  else
+    info "Opening rclone setup"
+    rclone config
+  fi
+}
+
+ensure_cloud_access_interactive() {
+  local remote_name=""
+
+  ensure_backup_config_interactive_if_missing
+  ensure_cloud_tools_installed_interactive || return 1
+  ensure_restic_password_interactive || return 1
+  load_restic_config cloud || return 1
+
+  remote_name="$(restic_repository_remote_name "$CLOUD_RESTIC_REPOSITORY")"
+  if [ -z "$remote_name" ]; then
+    warn "CLOUD_RESTIC_REPOSITORY must use an rclone remote. Current value: $CLOUD_RESTIC_REPOSITORY"
+    return 1
+  fi
+
+  if ! rclone_remote_exists "$remote_name"; then
+    warn "rclone remote '$remote_name' is not configured."
+    if ! prompt_yes_no "Open rclone config now?" "y"; then
+      return 1
+    fi
+    configure_rclone_auth_interactive "$remote_name"
+  fi
+
+  if ! verify_rclone_remote "$remote_name"; then
+    warn "Cloud auth for '$remote_name' needs attention."
+    if ! prompt_yes_no "Open rclone auth now?" "y"; then
+      return 1
+    fi
+    configure_rclone_auth_interactive "$remote_name"
+  fi
+
+  if ! verify_rclone_remote "$remote_name"; then
+    warn "rclone still cannot reach '$remote_name:'"
+    return 1
+  fi
+
+  success "Cloud backup is ready."
+  printf 'Cloud repository: %s\n' "$CLOUD_RESTIC_REPOSITORY"
+}
+
+normalize_home_path() {
+  local raw_input="$1"
+  local value
+
+  value="$(trim "$raw_input")"
+  if [ -z "$value" ]; then
+    printf '%s\n' "$HOME"
+    return
+  fi
+
+  case "$value" in
+    "~")
+      printf '%s\n' "$HOME"
+      ;;
+    "~/"*)
+      printf '%s/%s\n' "$HOME" "${value#"~/"}"
+      ;;
+    /*)
+      printf '%s\n' "$value"
+      ;;
+    *)
+      printf '%s/%s\n' "$HOME" "$value"
+      ;;
+  esac
+}
+
+canonicalize_path_allow_missing() {
+  local path="$1"
+
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m "$path"
+  else
+    readlink -m "$path"
+  fi
+}
+
+path_is_inside_home() {
+  local candidate="$1"
+  local home_path candidate_path
+
+  home_path="$(canonicalize_path_allow_missing "$HOME")"
+  candidate_path="$(canonicalize_path_allow_missing "$candidate")"
+
+  case "$candidate_path" in
+    "$home_path"|"$home_path"/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+path_is_outside_home() {
+  ! path_is_inside_home "$1"
+}
+
+path_is_same_or_child_of() {
+  local candidate="$1"
+  local base="$2"
+
+  if [ "$base" = "/" ]; then
+    return 0
+  fi
+
+  if [ "$candidate" = "$base" ]; then
+    return 0
+  fi
+
+  case "$candidate" in
+    "$base"/*)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+normalize_pawkup_path_entry() {
+  local raw_input="$1"
+  local value absolute_value canonical_home canonical_path
+
+  value="$(trim "$raw_input")"
+  [ -n "$value" ] || return 1
+
+  case "$value" in
+    "~"|"~/"*|/*)
+      absolute_value="$(normalize_home_path "$value")"
+      ;;
+    *)
+      absolute_value="$HOME/$value"
+      ;;
+  esac
+
+  canonical_home="$(canonicalize_path_allow_missing "$HOME")"
+  canonical_path="$(canonicalize_path_allow_missing "$absolute_value")"
+
+  if [ "$canonical_path" = "$canonical_home" ]; then
+    printf '.\n'
+  elif path_is_inside_home "$canonical_path"; then
+    printf '%s\n' "${canonical_path#"$canonical_home"/}"
+  else
+    printf '%s\n' "$canonical_path"
+  fi
+}
+
+path_entry_has_glob() {
+  case "$1" in
+    *'*'*|*'?'*|*'['*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+recommended_exclude_presets() {
+  cat <<EOF
+**/node_modules
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.next
+**/.turbo
+**/coverage
+**/dist
+**/build
+**/target
+~/.cache
+~/.local/share/Trash
+~/tmp
+~/temp
+~/.tmp
+~/.temp
+~/.npm
+~/.nvm
+~/.gradle/caches
+~/.local/state/pawkup/logs
+~/.local/state/pawkup/restore-staging
+**/.git/modules
+EOF
+}
+
+normalize_backup_config_path() {
+  normalize_pawkup_path_entry "$1"
+}
+
+normalize_restore_include_path() {
+  normalize_pawkup_path_entry "$1"
+}
+
+absolute_path_from_pawkup_path_entry() {
+  local normalized_input="$1"
+  local trimmed_input absolute_path
+
+  trimmed_input="$(trim "$normalized_input")"
+  [ -n "$trimmed_input" ] || return 1
+
+  case "$trimmed_input" in
+    ".")
+      absolute_path="$HOME"
+      ;;
+    /*)
+      absolute_path="$trimmed_input"
+      ;;
+    *)
+      absolute_path="$HOME/$trimmed_input"
+      ;;
+  esac
+
+  canonicalize_path_allow_missing "$absolute_path"
+}
+
+absolute_pattern_from_pawkup_path_entry() {
+  local normalized_input="$1"
+  local trimmed_input
+
+  trimmed_input="$(trim "$normalized_input")"
+  [ -n "$trimmed_input" ] || return 1
+
+  normalize_home_path "$trimmed_input"
+}
+
+glob_pattern_literal_prefix_path() {
+  local pattern="$1"
+  local literal_prefix
+
+  literal_prefix="$pattern"
+  while path_entry_has_glob "$literal_prefix"; do
+    literal_prefix="${literal_prefix%?}"
+  done
+
+  case "$literal_prefix" in
+    "")
+      literal_prefix="/"
+      ;;
+    "/")
+      ;;
+    */)
+      literal_prefix="${literal_prefix%/}"
+      [ -n "$literal_prefix" ] || literal_prefix="/"
+      ;;
+    */*)
+      literal_prefix="${literal_prefix%/*}"
+      [ -n "$literal_prefix" ] || literal_prefix="/"
+      ;;
+    *)
+      literal_prefix="."
+      ;;
+  esac
+
+  canonicalize_path_allow_missing "$literal_prefix"
+}
+
+ensure_sudo_is_available() {
+  if command -v sudo >/dev/null 2>&1; then
+    return 0
+  fi
+
+  warn "sudo is required for restores outside $HOME."
+  return 1
+}
+
+ensure_target_directory_interactive() {
+  local target_path="$1"
+
+  if [ -e "$target_path" ]; then
+    if [ ! -d "$target_path" ]; then
+      warn "$target_path exists but is not a directory."
+      return 1
+    fi
+    return 0
+  fi
+
+  if ! prompt_yes_no "Create $target_path?" "y"; then
+    return 1
+  fi
+
+  if path_is_inside_home "$target_path"; then
+    mkdir -p "$target_path"
+  else
+    sudo mkdir -p "$target_path"
+  fi
+}
+
+mkdir_path_with_optional_sudo() {
+  local target_path="$1"
+  local use_sudo="${2:-false}"
+
+  if [ "$use_sudo" = "true" ]; then
+    sudo -n mkdir -p "$target_path"
+  else
+    mkdir -p "$target_path"
+  fi
+}
+
+rsync_copy_options() {
+  printf '%s\n' -aHAX --no-inc-recursive --human-readable --info=progress2
+}
+
+copy_tree_to_target() {
+  local source_dir="$1"
+  local target_dir="$2"
+  local use_sudo="${3:-false}"
+  local -a rsync_options=()
+
+  mkdir_path_with_optional_sudo "$target_dir" "$use_sudo" || return 1
+
+  if command -v rsync >/dev/null 2>&1; then
+    mapfile -t rsync_options < <(rsync_copy_options)
+    if [ "$use_sudo" = "true" ]; then
+      sudo -n rsync "${rsync_options[@]}" --numeric-ids "$source_dir"/ "$target_dir"/
+    else
+      rsync "${rsync_options[@]}" "$source_dir"/ "$target_dir"/
+    fi
+  else
+    warn "rsync is not installed. Falling back to cp without progress output."
+    if [ "$use_sudo" = "true" ]; then
+      sudo -n cp -a "$source_dir"/. "$target_dir"/
+    else
+      cp -a "$source_dir"/. "$target_dir"/
+    fi
+  fi
+}
+
+copy_path_to_exact_target() {
+  local source_path="$1"
+  local destination_path="$2"
+  local use_sudo="${3:-false}"
+  local parent_dir=""
+  local is_directory="false"
+  local -a rsync_options=()
+
+  if [ "$use_sudo" = "true" ]; then
+    if sudo -n test -d "$source_path" && ! sudo -n test -L "$source_path"; then
+      is_directory="true"
+    fi
+  elif [ -d "$source_path" ] && [ ! -L "$source_path" ]; then
+    is_directory="true"
+  fi
+
+  if [ "$is_directory" = "true" ]; then
+    copy_tree_to_target "$source_path" "$destination_path" "$use_sudo"
+    return $?
+  fi
+
+  parent_dir="$(dirname "$destination_path")"
+  mkdir_path_with_optional_sudo "$parent_dir" "$use_sudo" || return 1
+
+  if command -v rsync >/dev/null 2>&1; then
+    mapfile -t rsync_options < <(rsync_copy_options)
+    if [ "$use_sudo" = "true" ]; then
+      sudo -n rsync "${rsync_options[@]}" --numeric-ids "$source_path" "$parent_dir"/
+    else
+      rsync "${rsync_options[@]}" "$source_path" "$parent_dir"/
+    fi
+  else
+    warn "rsync is not installed. Falling back to cp without progress output."
+    if [ "$use_sudo" = "true" ]; then
+      sudo -n cp -a "$source_path" "$parent_dir"/
+    else
+      cp -a "$source_path" "$parent_dir"/
+    fi
+  fi
+}
+
+snapshot_ls_output() {
+  local snapshot="$1"
+
+  restic_cmd ls "$snapshot"
+}
+
+resolve_snapshot_recorded_path() {
+  local snapshot="$1"
+  local absolute_path="$2"
+  local canonical_path candidate
+
+  canonical_path="$(canonicalize_path_allow_missing "$absolute_path")"
+
+  while IFS= read -r candidate; do
+    if [ "$candidate" = "$canonical_path" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(snapshot_ls_output "$snapshot")
+
+  return 1
+}
+
+snapshot_home_root_for_path() {
+  local absolute_path="$1"
+  local canonical_path rest user_name
+
+  canonical_path="$(canonicalize_path_allow_missing "$absolute_path")"
+
+  case "$canonical_path" in
+    /home/*)
+      rest="${canonical_path#/home/}"
+      user_name="${rest%%/*}"
+      [ -n "$user_name" ] || return 1
+      printf '/home/%s\n' "$user_name"
+      ;;
+    /Users/*)
+      rest="${canonical_path#/Users/}"
+      user_name="${rest%%/*}"
+      [ -n "$user_name" ] || return 1
+      printf '/Users/%s\n' "$user_name"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+relative_path_under_root() {
+  local absolute_path="$1"
+  local root_path="$2"
+  local canonical_path canonical_root
+
+  canonical_path="$(canonicalize_path_allow_missing "$absolute_path")"
+  canonical_root="$(canonicalize_path_allow_missing "$root_path")"
+
+  if [ "$canonical_path" = "$canonical_root" ]; then
+    printf '.\n'
+    return 0
+  fi
+
+  case "$canonical_path" in
+    "$canonical_root"/*)
+      printf '%s\n' "${canonical_path#"$canonical_root"/}"
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+current_home_relative_path() {
+  relative_path_under_root "$1" "$HOME"
+}
+
+snapshot_home_roots() {
+  local snapshot="$1"
+  local source_path root_path
+  local -A seen_roots=()
+
+  while IFS= read -r source_path; do
+    root_path="$(snapshot_home_root_for_path "$source_path" || true)"
+    [ -n "$root_path" ] || continue
+
+    if [ -z "${seen_roots[$root_path]+x}" ]; then
+      seen_roots["$root_path"]=1
+      printf '%s\n' "$root_path"
+    fi
+  done < <(snapshot_recorded_source_paths "$snapshot")
+}
+
+join_root_and_relative_path() {
+  local root_path="$1"
+  local relative_path="$2"
+
+  if [ "$relative_path" = "." ] || [ -z "$relative_path" ]; then
+    printf '%s\n' "$root_path"
+  else
+    printf '%s/%s\n' "$root_path" "$relative_path"
+  fi
+}
+
+resolve_snapshot_path_for_restore() {
+  local snapshot="$1"
+  local absolute_path="$2"
+  local relative_path="" root_path="" candidate_path=""
+
+  if resolve_snapshot_recorded_path "$snapshot" "$absolute_path"; then
+    return 0
+  fi
+
+  relative_path="$(current_home_relative_path "$absolute_path" || true)"
+  [ -n "$relative_path" ] || return 1
+
+  while IFS= read -r root_path; do
+    candidate_path="$(join_root_and_relative_path "$root_path" "$relative_path")"
+    if resolve_snapshot_recorded_path "$snapshot" "$candidate_path"; then
+      return 0
+    fi
+  done < <(snapshot_home_roots "$snapshot")
+
+  return 1
+}
+
+detect_restored_source_dir() {
+  local staging_dir="$1"
+  local use_sudo="${2:-false}"
+
+  if [ "$use_sudo" = "true" ]; then
+    if sudo -n find "$staging_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+      printf '%s\n' "$staging_dir"
+      return 0
+    fi
+    return 1
+  fi
+
+  if find "$staging_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+    printf '%s\n' "$staging_dir"
+    return 0
+  fi
+
+  return 1
+}
+
+local_restic_repository_exists() {
+  load_backup_settings >/dev/null 2>&1 || return 1
+  [ -f "$LOCAL_RESTIC_REPOSITORY/config" ]
+}
+
+local_restic_repository_has_snapshots() {
+  load_backup_settings >/dev/null 2>&1 || return 1
+  [ -d "$LOCAL_RESTIC_REPOSITORY/snapshots" ] || return 1
+  find "$LOCAL_RESTIC_REPOSITORY/snapshots" -mindepth 1 -print -quit | grep -q .
+}
+
+restic_source_repository_exists() {
+  local source="${1:-cloud}"
+  local status=0
+
+  case "$source" in
+    local)
+      local_restic_repository_exists
+      return $?
+      ;;
+    cloud)
+      load_restic_config cloud || return 2
+      if restic_cmd snapshots >/dev/null 2>&1; then
+        return 0
+      fi
+      status=$?
+      case "$status" in
+        10)
+          return 1
+          ;;
+        *)
+          return "$status"
+          ;;
+      esac
+      ;;
+    *)
+      warn "Unknown restic source: $source"
+      return 2
+      ;;
+  esac
+}
+
+restic_current_key_id_with_password_file() {
+  local source="$1"
+  local password_file="$2"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 is required to inspect restic repository keys."
+    return 1
+  fi
+
+  load_restic_config "$source" || return 1
+  restic_cmd_with_password_file "$password_file" --json key list | python3 -c '
+import json
+import sys
+
+keys = json.load(sys.stdin)
+for key in keys:
+    if key.get("current"):
+        print(key.get("id", ""))
+        sys.exit(0)
+sys.exit(1)
+'
+}
+
+install_secret_file_from_file() {
+  local source_file="$1"
+  local destination_file="$2"
+  local tmp_file=""
+
+  mkdir -p "$(dirname "$destination_file")"
+  tmp_file="$(mktemp "$(dirname "$destination_file")/.tmp.XXXXXX")"
+  cp "$source_file" "$tmp_file"
+  chmod 600 "$tmp_file"
+  mv "$tmp_file" "$destination_file"
+}
+
+rotate_restic_repository_passwords() {
+  local new_password_file="$1"
+  local destination_password_file="$2"
+  shift 2
+  local source="" old_key_id="" remove_status=0
+  local -a sources=("$@")
+  local -a old_key_ids=()
+
+  [ "${#sources[@]}" -gt 0 ] || return 0
+
+  for source in "${sources[@]}"; do
+    info "Adding a new restic key to the $source repository"
+    load_restic_config "$source" || return 1
+    clear_stale_restic_locks_if_any
+
+    old_key_id="$(restic_current_key_id_with_password_file "$source" "$RESTIC_PASSWORD_FILE")" || {
+      warn "Could not identify the current $source repository key."
+      return 1
+    }
+    old_key_ids+=("$old_key_id")
+
+    if ! restic_cmd key add --new-password-file "$new_password_file" >/dev/null; then
+      warn "Could not add the new key to the $source repository."
+      return 1
+    fi
+  done
+
+  for source in "${sources[@]}"; do
+    info "Verifying the new password against the $source repository"
+    load_restic_config "$source" || return 1
+    if ! restic_cmd_with_password_file "$new_password_file" snapshots >/dev/null; then
+      warn "The new password did not unlock the $source repository."
+      return 1
+    fi
+  done
+
+  install_secret_file_from_file "$new_password_file" "$destination_password_file" || return 1
+
+  for source in "${!sources[@]}"; do
+    info "Removing the old restic key from the ${sources[$source]} repository"
+    load_restic_config "${sources[$source]}" || {
+      remove_status=1
+      continue
+    }
+
+    if ! restic_cmd key remove "${old_key_ids[$source]}"; then
+      warn "The new password works, but the old key could not be removed from the ${sources[$source]} repository."
+      remove_status=1
+    fi
+  done
+
+  if [ "$remove_status" -ne 0 ]; then
+    warn "The repo password file was updated. Run a repository health check and remove any old keys manually if needed."
+  fi
+
+  return 0
+}
+
+run_restic_repository_check() {
+  local source="$1"
+  local read_data_subset="${2:-}"
+
+  load_restic_config "$source" || return 1
+  clear_stale_restic_locks_if_any
+
+  info "Checking the $source restic repository"
+  if [ -n "$read_data_subset" ]; then
+    restic_cmd check --read-data-subset "$read_data_subset"
+  else
+    restic_cmd check
+  fi
+}
+
+list_repository_snapshots() {
+  local source="${1:-cloud}"
+
+  if [ "$source" = "local" ] && ! local_restic_repository_exists; then
+    warn "Local backup repo not found at $LOCAL_RESTIC_REPOSITORY"
+    return 1
+  fi
+
+  load_restic_config "$source" || return 1
+  clear_stale_restic_locks_if_any
+  info "Listing ${source} snapshots"
+  restic_cmd snapshots
+}
+
+snapshot_recorded_source_paths() {
+  local snapshot="$1"
+  local details_file=""
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 is required to inspect snapshot source paths."
+    return 1
+  fi
+
+  details_file="$(mktemp)"
+  if ! restic_cmd snapshots --json "$snapshot" >"$details_file"; then
+    rm -f "$details_file"
+    return 1
+  fi
+
+  python3 - "$details_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+
+if not data:
+    sys.exit(1)
+
+for path in data[0].get("paths", []):
+    print(path)
+PY
+
+  rm -f "$details_file"
+}
+
+filter_redundant_restore_paths() {
+  local candidate_path kept_path
+  local -A seen_paths=()
+  local -a unique_paths=()
+  local -a kept_paths=()
+  local shortest_index=0 shortest_length=0 index=0 skip_candidate="false"
+
+  for candidate_path in "$@"; do
+    [ -n "$candidate_path" ] || continue
+    candidate_path="$(canonicalize_path_allow_missing "$candidate_path")"
+    if [ -n "${seen_paths[$candidate_path]+x}" ]; then
+      continue
+    fi
+    seen_paths["$candidate_path"]=1
+    unique_paths+=("$candidate_path")
+  done
+
+  while [ "${#unique_paths[@]}" -gt 0 ]; do
+    shortest_index=0
+    shortest_length="${#unique_paths[0]}"
+
+    for index in "${!unique_paths[@]}"; do
+      if [ "${#unique_paths[$index]}" -lt "$shortest_length" ]; then
+        shortest_index="$index"
+        shortest_length="${#unique_paths[$index]}"
+      fi
+    done
+
+    candidate_path="${unique_paths[$shortest_index]}"
+    unset 'unique_paths[$shortest_index]'
+    unique_paths=("${unique_paths[@]}")
+
+    skip_candidate="false"
+    for kept_path in "${kept_paths[@]}"; do
+      if path_is_same_or_child_of "$candidate_path" "$kept_path"; then
+        skip_candidate="true"
+        break
+      fi
+    done
+
+    if [ "$skip_candidate" != "true" ]; then
+      kept_paths+=("$candidate_path")
+    fi
+  done
+
+  printf '%s\n' "${kept_paths[@]}"
+}
+
+build_restore_destination_path() {
+  local target_dir="$1"
+  local original_path="$2"
+  local restore_mode="$3"
+  local canonical_target canonical_original relative_path="" source_home_root="" current_home_path=""
+
+  canonical_target="$(canonicalize_path_allow_missing "$target_dir")"
+  canonical_original="$(canonicalize_path_allow_missing "$original_path")"
+  source_home_root="$(snapshot_home_root_for_path "$canonical_original" || true)"
+
+  if [ -n "$source_home_root" ]; then
+    relative_path="$(relative_path_under_root "$canonical_original" "$source_home_root")" || return 1
+    current_home_path="$(join_root_and_relative_path "$(canonicalize_path_allow_missing "$HOME")" "$relative_path")"
+
+    if [ "$restore_mode" = "original" ]; then
+      printf '%s\n' "$current_home_path"
+    else
+      printf '%s/%s\n' "$canonical_target" "${current_home_path#/}"
+    fi
+    return 0
+  fi
+
+  if path_is_inside_home "$canonical_original"; then
+    relative_path="$(current_home_relative_path "$canonical_original")" || return 1
+    current_home_path="$(join_root_and_relative_path "$(canonicalize_path_allow_missing "$HOME")" "$relative_path")"
+
+    if [ "$restore_mode" = "original" ]; then
+      printf '%s\n' "$current_home_path"
+    else
+      printf '%s/%s\n' "$canonical_target" "${current_home_path#/}"
+    fi
+    return 0
+  fi
+
+  if [ "$restore_mode" = "original" ]; then
+    printf '%s\n' "$canonical_original"
+    return 0
+  fi
+
+  if [ "$canonical_original" = "/" ]; then
+    printf '%s\n' "$canonical_target"
+  else
+    printf '%s/%s\n' "$canonical_target" "${canonical_original#/}"
+  fi
+}
+
+restore_path_represents_home_content() {
+  local original_path="$1"
+
+  if path_is_inside_home "$original_path"; then
+    return 0
+  fi
+
+  snapshot_home_root_for_path "$original_path" >/dev/null 2>&1
+}
+
+restore_path_represents_system_content() {
+  ! restore_path_represents_home_content "$1"
+}
+
+chown_restored_home_content_if_needed() {
+  local original_path="$1"
+  local destination_path="$2"
+  local use_sudo="${3:-false}"
+
+  [ "$use_sudo" = "true" ] || return 0
+  restore_path_represents_home_content "$original_path" || return 0
+
+  sudo -n chown -hR "$(id -u):$(id -g)" "$destination_path"
+}
+
+warn_about_system_restore_paths() {
+  local target_dir="$1"
+  local restore_mode="$2"
+  shift 2
+  local path
+  local -a system_paths=()
+
+  for path in "$@"; do
+    if restore_path_represents_system_content "$path"; then
+      system_paths+=("$path")
+    fi
+  done
+
+  [ "${#system_paths[@]}" -gt 0 ] || return 0
+  [ "$restore_mode" = "original" ] || return 0
+
+  warn "Live restore writes outside $HOME with sudo for these:"
+  printf '  %s\n' "${system_paths[@]}" >&2
+  if [ -t 0 ] && ! prompt_yes_no "Continue?" "n"; then
+    return 1
+  fi
+}
+
+restore_paths_include_system_content() {
+  local path
+
+  for path in "$@"; do
+    if restore_path_represents_system_content "$path"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+create_restore_staging_dir() {
+  local use_sudo="${1:-false}"
+
+  if [ "$use_sudo" = "true" ]; then
+    sudo -n mktemp -d "/tmp/pawkup-restore.XXXXXX"
+  else
+    mkdir -p "$PAWKUP_RESTORE_STAGING_DIR"
+    mktemp -d "$PAWKUP_RESTORE_STAGING_DIR/restore.XXXXXX"
+  fi
+}
+
+remove_restore_staging_dir() {
+  local staging_dir="$1"
+  local use_sudo="${2:-false}"
+
+  [ -n "$staging_dir" ] || return 0
+
+  if [ "$use_sudo" = "true" ]; then
+    sudo -n rm -rf "$staging_dir"
+  else
+    rm -rf "$staging_dir"
+  fi
+}
+
+run_restic_restore_command() {
+  local use_sudo="$1"
+  shift
+  local cmd=("$@")
+  local -a sudo_cmd=()
+
+  if [ "$use_sudo" = "true" ]; then
+    sudo_cmd=(sudo -n env "RESTIC_REPOSITORY=$RESTIC_REPOSITORY" "RESTIC_PASSWORD_FILE=$RESTIC_PASSWORD_FILE")
+    if [ -n "${RCLONE_CONFIG:-}" ]; then
+      sudo_cmd+=("RCLONE_CONFIG=$RCLONE_CONFIG")
+    fi
+    sudo_cmd+=("${cmd[@]}")
+    run_with_heartbeat "Restore in progress" "${sudo_cmd[@]}"
+  else
+    run_with_heartbeat "Restore in progress" "${cmd[@]}"
+  fi
+}
+
+restore_snapshot_to_target() {
+  local source="$1"
+  local snapshot="$2"
+  local target_dir="$3"
+  shift 3
+  local relative_includes=("$@")
+  local staging_dir="" cmd=()
+  local snapshot_status=0
+  local use_sudo="false"
+  local restore_mode="stage"
+  local include_path absolute_path resolved_path source_path destination_path
+  local copy_label="Copying restored files"
+  local path_index=0 path_count=0
+  local -a requested_paths=()
+
+  target_dir="$(canonicalize_path_allow_missing "$(normalize_home_path "$target_dir")")"
+  if [ "$target_dir" = "/" ]; then
+    restore_mode="original"
+  fi
+
+  if [ "$source" = "local" ] && ! local_restic_repository_exists; then
+    return 3
+  fi
+
+  if [ "$source" = "local" ] && ! local_restic_repository_has_snapshots; then
+    return 3
+  fi
+
+  load_restic_config "$source" || return 1
+  if [ "$source" = "cloud" ]; then
+    export RCLONE_CONFIG="$PAWKUP_RCLONE_CONFIG"
+  fi
+
+  if snapshot_summary_records "$source" >/dev/null; then
+    :
+  else
+    snapshot_status=$?
+    return "$snapshot_status"
+  fi
+
+  clear_stale_restic_locks_if_any
+
+  if [ "${#relative_includes[@]}" -gt 0 ]; then
+    for include_path in "${relative_includes[@]}"; do
+      absolute_path="$(absolute_path_from_pawkup_path_entry "$include_path")" || {
+        warn "Invalid include path: $include_path"
+        return 1
+      }
+      requested_paths+=("$absolute_path")
+    done
+  else
+    mapfile -t requested_paths < <(snapshot_recorded_source_paths "$snapshot") || return 1
+  fi
+
+  if [ "${#requested_paths[@]}" -eq 0 ]; then
+    warn "The selected snapshot did not describe any source paths."
+    return 1
+  fi
+
+  mapfile -t requested_paths < <(filter_redundant_restore_paths "${requested_paths[@]}")
+
+  if [ "$restore_mode" = "original" ] && restore_paths_include_system_content "${requested_paths[@]}"; then
+    use_sudo="true"
+    copy_label="Copying restored files with sudo"
+  fi
+
+  warn_about_system_restore_paths "$target_dir" "$restore_mode" "${requested_paths[@]}" || return 1
+
+  staging_dir="$(create_restore_staging_dir "$use_sudo")" || return 1
+
+  cmd=(restic --retry-lock "$PAWKUP_RESTIC_RETRY_LOCK" restore "$snapshot" --target "$staging_dir")
+  if [ "${#relative_includes[@]}" -gt 0 ]; then
+    for include_path in "${relative_includes[@]}"; do
+      absolute_path="$(absolute_path_from_pawkup_path_entry "$include_path")" || {
+        warn "Invalid include path: $include_path"
+        remove_restore_staging_dir "$staging_dir" "$use_sudo"
+        return 1
+      }
+      resolved_path="$(resolve_snapshot_path_for_restore "$snapshot" "$absolute_path")" || {
+        warn "The snapshot did not contain $include_path"
+        remove_restore_staging_dir "$staging_dir" "$use_sudo"
+        return 1
+      }
+      cmd+=(--include "$resolved_path")
+    done
+  fi
+
+  info "Downloading $source snapshot $snapshot"
+  if ! run_restic_restore_command "$use_sudo" "${cmd[@]}"; then
+    warn "Restore failed. Staging was left at $staging_dir"
+    return 1
+  fi
+
+  detect_restored_source_dir "$staging_dir" "$use_sudo" >/dev/null 2>&1 || {
+    warn "The selected snapshot did not restore any files."
+    warn "Staging was left at $staging_dir"
+    return 1
+  }
+
+  info "$copy_label"
+  path_count="${#requested_paths[@]}"
+  for absolute_path in "${requested_paths[@]}"; do
+    path_index=$((path_index + 1))
+    resolved_path="$(resolve_snapshot_path_for_restore "$snapshot" "$absolute_path")" || {
+      warn "The snapshot no longer exposes $absolute_path"
+      warn "Staging was left at $staging_dir"
+      return 1
+    }
+    source_path="$staging_dir$resolved_path"
+    destination_path="$(build_restore_destination_path "$target_dir" "$absolute_path" "$restore_mode")"
+
+    printf 'Copying path %s/%s: %s\n' "$path_index" "$path_count" "$absolute_path"
+    if ! copy_path_to_exact_target "$source_path" "$destination_path" "$use_sudo"; then
+      warn "Copy step failed. Staging was left at $staging_dir"
+      return 1
+    fi
+    if ! chown_restored_home_content_if_needed "$absolute_path" "$destination_path" "$use_sudo"; then
+      warn "Ownership fix failed. Staging was left at $staging_dir"
+      return 1
+    fi
+  done
+
+  remove_restore_staging_dir "$staging_dir" "$use_sudo"
+  if [ "$restore_mode" = "original" ]; then
+    success "Restore complete."
+  else
+    success "Restore staged in $target_dir"
+  fi
+}
+
+list_cloud_snapshots() {
+  list_repository_snapshots cloud
+}
+
+normalize_bool_string() {
+  case "${1,,}" in
+    1|true|yes|y|on)
+      printf '%s\n' "true"
+      ;;
+    *)
+      printf '%s\n' "false"
+      ;;
+  esac
+}
+
+default_backup_retention_description() {
+  printf '%s\n' "Keep weekly restore points for the last 3 months"
+}
+
+default_backup_retention_args() {
+  printf '%s\n' "--keep-within-weekly 3m"
+}
+
+backup_retention_args_as_array() {
+  local retention_args_string="$1"
+
+  read -r -a BACKUP_RETENTION_ARGV <<< "$retention_args_string"
+  if [ "${#BACKUP_RETENTION_ARGV[@]}" -eq 0 ]; then
+    return 1
+  fi
+}
+
+systemctl_user_property() {
+  local unit_name="$1"
+  local property_name="$2"
+
+  systemctl --user show "$unit_name" -P "$property_name" 2>/dev/null || true
+}
+
+ensure_user_systemd_is_available() {
+  if systemctl --user show-environment >/dev/null 2>&1; then
+    return 0
+  fi
+
+  warn "Your user systemd session is not available right now."
+  warn "Log in normally and try again."
+  return 1
+}
+
+user_linger_enabled() {
+  [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)" = "yes" ]
+}
+
+format_systemd_time_or_na() {
+  local value="$1"
+
+  if [ -z "$value" ] || [ "$value" = "n/a" ]; then
+    printf '%s\n' "n/a"
+  else
+    printf '%s\n' "$value"
+  fi
+}
+
+save_backup_settings() {
+  local schedule_mode="$1"
+  local on_calendar="$2"
+  local persistent="$3"
+  local accuracy_sec="$4"
+  local schedule_description="$5"
+  local retention_description="$6"
+  local retention_args="$7"
+  local remote_name="" local_repository="" cloud_repository="" password_file="" repository_name=""
+
+  ensure_backup_config_template
+  load_backup_settings || return 1
+
+  repository_name="$BACKUP_REPOSITORY_NAME"
+  remote_name="$(restic_repository_remote_name "$CLOUD_RESTIC_REPOSITORY")"
+  local_repository="$LOCAL_RESTIC_REPOSITORY"
+  cloud_repository="$CLOUD_RESTIC_REPOSITORY"
+  password_file="$RESTIC_PASSWORD_FILE"
+
+  write_backup_config_file \
+    "$repository_name" \
+    "$local_repository" \
+    "$cloud_repository" \
+    "$password_file" \
+    "$schedule_mode" \
+    "$on_calendar" \
+    "$persistent" \
+    "$accuracy_sec" \
+    "$schedule_description" \
+    "$retention_description" \
+    "$retention_args"
+
+  if [ -n "$remote_name" ]; then
+    success "Backup settings saved. Remote: $remote_name"
+  else
+    success "Backup settings saved."
+  fi
+}
+
+write_backup_service_file() {
+  load_backup_settings || return 1
+  mkdir -p "$PAWKUP_USER_SYSTEMD_DIR"
+  if [ "$BACKUP_SCHEDULE_MODE" = "local-only" ]; then
+    cat > "$PAWKUP_BACKUP_SERVICE_FILE" <<EOF
+[Unit]
+Description=Scheduled pawkup backup
+ConditionPathExists=$PAWKUP_ENV_FILE
+ConditionPathExists=$PAWKUP_PASSWORD_FILE
+ConditionPathExists=$PAWKUP_INCLUDE_PATHS_FILE
+ConditionPathExists=$PAWKUP_EXCLUDE_PATHS_FILE
+
+[Service]
+Type=oneshot
+WorkingDirectory=$PAWKUP_HOME
+Environment=HOME=$PAWKUP_HOME
+ExecStart=$PAWKUP_COMMAND_PATH backup --$BACKUP_SCHEDULE_MODE
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+EOF
+  else
+    cat > "$PAWKUP_BACKUP_SERVICE_FILE" <<EOF
+[Unit]
+Description=Scheduled pawkup backup
+ConditionPathExists=$PAWKUP_ENV_FILE
+ConditionPathExists=$PAWKUP_PASSWORD_FILE
+ConditionPathExists=$PAWKUP_INCLUDE_PATHS_FILE
+ConditionPathExists=$PAWKUP_EXCLUDE_PATHS_FILE
+ConditionPathExists=$PAWKUP_RCLONE_CONFIG
+
+[Service]
+Type=oneshot
+WorkingDirectory=$PAWKUP_HOME
+Environment=HOME=$PAWKUP_HOME
+ExecStart=$PAWKUP_COMMAND_PATH backup --$BACKUP_SCHEDULE_MODE
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+EOF
+  fi
+  chmod 644 "$PAWKUP_BACKUP_SERVICE_FILE"
+}
+
+write_backup_timer_file() {
+  load_backup_settings || return 1
+  mkdir -p "$PAWKUP_USER_SYSTEMD_DIR"
+
+  cat > "$PAWKUP_BACKUP_TIMER_FILE" <<EOF
+[Unit]
+Description=Run pawkup backup automatically
+
+[Timer]
+OnCalendar=$BACKUP_ON_CALENDAR
+Persistent=$BACKUP_PERSISTENT
+AccuracySec=$BACKUP_ACCURACY_SEC
+
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 644 "$PAWKUP_BACKUP_TIMER_FILE"
+}
+
+apply_backup_schedule() {
+  ensure_user_systemd_is_available || return 1
+  write_backup_service_file || return 1
+  write_backup_timer_file || return 1
+  systemctl --user daemon-reload
+  systemctl --user enable "$PAWKUP_BACKUP_TIMER_NAME" >/dev/null
+  systemctl --user restart "$PAWKUP_BACKUP_TIMER_NAME"
+  success "Backup schedule is active."
+  if ! user_linger_enabled; then
+    warn "This backup timer runs while your user systemd session is active."
+  fi
+}
+
+pause_backup_schedule() {
+  ensure_user_systemd_is_available || return 1
+  if [ ! -f "$PAWKUP_BACKUP_TIMER_FILE" ]; then
+    warn "No scheduled backup task exists."
+    return 1
+  fi
+
+  systemctl --user stop "$PAWKUP_BACKUP_TIMER_NAME" "$PAWKUP_BACKUP_SERVICE_NAME" >/dev/null 2>&1 || true
+  systemctl --user disable "$PAWKUP_BACKUP_TIMER_NAME" >/dev/null 2>&1 || true
+  success "Scheduled backups paused."
+}
+
+resume_backup_schedule() {
+  ensure_user_systemd_is_available || return 1
+  if [ ! -f "$PAWKUP_BACKUP_TIMER_FILE" ]; then
+    warn "No scheduled backup task exists."
+    return 1
+  fi
+
+  systemctl --user daemon-reload
+  systemctl --user enable "$PAWKUP_BACKUP_TIMER_NAME" >/dev/null
+  systemctl --user restart "$PAWKUP_BACKUP_TIMER_NAME"
+  success "Scheduled backups resumed."
+}
+
+delete_backup_schedule() {
+  ensure_user_systemd_is_available || return 1
+  if [ ! -f "$PAWKUP_BACKUP_TIMER_FILE" ] && [ ! -f "$PAWKUP_BACKUP_SERVICE_FILE" ]; then
+    warn "No scheduled backup task exists."
+    return 1
+  fi
+
+  systemctl --user stop "$PAWKUP_BACKUP_TIMER_NAME" "$PAWKUP_BACKUP_SERVICE_NAME" >/dev/null 2>&1 || true
+  systemctl --user disable "$PAWKUP_BACKUP_TIMER_NAME" >/dev/null 2>&1 || true
+  rm -f "$PAWKUP_BACKUP_SERVICE_FILE" "$PAWKUP_BACKUP_TIMER_FILE"
+  systemctl --user daemon-reload
+  success "Scheduled backup task deleted. Cloud config was kept."
+}
+
+run_backup_schedule_now() {
+  ensure_user_systemd_is_available || return 1
+  if [ ! -f "$PAWKUP_BACKUP_SERVICE_FILE" ]; then
+    warn "No scheduled backup task exists."
+    return 1
+  fi
+
+  systemctl --user start "$PAWKUP_BACKUP_SERVICE_NAME"
+}
+
+show_backup_schedule_status() {
+  local enabled active next last service_active task_exists="no"
+  local schedule_status="not created" current_run="idle"
+
+  if ! load_backup_settings >/dev/null 2>&1; then
+    warn "Backup config is not ready."
+    return 1
+  fi
+
+  if [ -f "$PAWKUP_BACKUP_TIMER_FILE" ] || [ -f "$PAWKUP_BACKUP_SERVICE_FILE" ]; then
+    task_exists="yes"
+  fi
+
+  enabled="$(systemctl --user is-enabled "$PAWKUP_BACKUP_TIMER_NAME" 2>/dev/null || true)"
+  active="$(systemctl_user_property "$PAWKUP_BACKUP_TIMER_NAME" ActiveState)"
+  service_active="$(systemctl_user_property "$PAWKUP_BACKUP_SERVICE_NAME" ActiveState)"
+  next="$(format_systemd_time_or_na "$(systemctl_user_property "$PAWKUP_BACKUP_TIMER_NAME" NextElapseUSecRealtime)")"
+  last="$(format_systemd_time_or_na "$(systemctl_user_property "$PAWKUP_BACKUP_TIMER_NAME" LastTriggerUSec)")"
+
+  if [ "$task_exists" = "yes" ]; then
+    case "${enabled:-disabled}:${active:-inactive}" in
+      enabled:active)
+        schedule_status="active"
+        ;;
+      disabled:*)
+        schedule_status="paused"
+        ;;
+      *)
+        schedule_status="${active:-inactive}"
+        ;;
+    esac
+
+    case "${service_active:-inactive}" in
+      active|activating)
+        current_run="running"
+        ;;
+      failed)
+        current_run="failed"
+        ;;
+      *)
+        current_run="idle"
+        ;;
+    esac
+  fi
+
+  printf 'Backup schedule:\n'
+  printf '  Mode:        %s\n' "$BACKUP_SCHEDULE_MODE"
+  printf '  Frequency:   %s\n' "$BACKUP_SCHEDULE_DESCRIPTION"
+  printf '  Status:      %s\n' "$schedule_status"
+  printf '  Timing:      %s\n' "$BACKUP_ON_CALENDAR"
+  printf '  Retention:   %s\n' "$BACKUP_RETENTION_DESCRIPTION"
+  printf '  Next run:    %s\n' "$next"
+  printf '  Last run:    %s\n' "$last"
+  printf '  Current run: %s\n' "$current_run"
+}

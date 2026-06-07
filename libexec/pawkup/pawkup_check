@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/pawkup_shared"
+
+SOURCE="all"
+READ_DATA_SUBSET="1%"
+CHECKED_COUNT=0
+
+cleanup() {
+  local status="$?"
+  release_operation_lock
+  finalize_error_capture "$status"
+}
+
+trap cleanup EXIT
+
+usage() {
+  cat <<EOF
+Usage:
+  pawkup check [--source local|cloud|all] [--read-data-subset VALUE | --metadata-only]
+  pawkup_check [--source local|cloud|all] [--read-data-subset VALUE | --metadata-only]
+
+Examples:
+  pawkup check
+  pawkup check --source local
+  pawkup check --source cloud --read-data-subset 5%
+  pawkup check --metadata-only
+EOF
+}
+
+parse_source_value() {
+  case "$1" in
+    local|cloud|all)
+      SOURCE="$1"
+      ;;
+    *)
+      warn "Source must be 'local', 'cloud', or 'all'."
+      exit 1
+      ;;
+  esac
+}
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --source)
+        if [ "$#" -lt 2 ]; then
+          warn "Missing value for --source"
+          exit 1
+        fi
+        parse_source_value "$2"
+        shift 2
+        ;;
+      --read-data-subset)
+        if [ "$#" -lt 2 ]; then
+          warn "Missing value for --read-data-subset"
+          exit 1
+        fi
+        READ_DATA_SUBSET="$2"
+        shift 2
+        ;;
+      --metadata-only)
+        READ_DATA_SUBSET=""
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        warn "Unknown option: $1"
+        usage >&2
+        exit 1
+        ;;
+    esac
+  done
+}
+
+check_source() {
+  local source="$1"
+  local missing_ok="${2:-false}"
+  local status=0
+
+  if restic_source_repository_exists "$source"; then
+    status=0
+  else
+    status=$?
+    if [ "$status" -eq 1 ]; then
+      warn "The $source repository is not initialized yet."
+    else
+      warn "The $source repository could not be opened."
+    fi
+    if [ "$missing_ok" = "true" ]; then
+      return 0
+    fi
+    return "$status"
+  fi
+
+  run_restic_repository_check "$source" "$READ_DATA_SUBSET"
+  CHECKED_COUNT=$((CHECKED_COUNT + 1))
+}
+
+main() {
+  parse_args "$@"
+  ensure_pawkup_not_running_as_root
+  maybe_reexec_with_systemd_inhibit "repository health check is running" "$0" "$@"
+  start_failure_log_capture "check"
+  acquire_operation_lock "check ($SOURCE)" || exit 1
+
+  case "$SOURCE" in
+    local)
+      check_source local
+      ;;
+    cloud)
+      check_source cloud
+      ;;
+    all)
+      check_source local true
+      check_source cloud true
+      if [ "$CHECKED_COUNT" -eq 0 ]; then
+        warn "No initialized repositories were found to check."
+        return 1
+      fi
+      ;;
+  esac
+}
+
+main "$@"

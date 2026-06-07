@@ -1,0 +1,535 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/pawkup_shared"
+
+MODE="local-only"
+DRY_RUN="false"
+PATHS_FILE=""
+EXCLUDE_FILE=""
+declare -a OUTSIDE_HOME_INCLUDE_PATHS=()
+declare -a CONTRADICTORY_EXCLUDE_ENTRIES=()
+
+cleanup() {
+  local status="$?"
+
+  if [ -n "$PATHS_FILE" ] && [ -f "$PATHS_FILE" ]; then
+    rm -f "$PATHS_FILE"
+  fi
+
+  if [ -n "$EXCLUDE_FILE" ] && [ -f "$EXCLUDE_FILE" ]; then
+    rm -f "$EXCLUDE_FILE"
+  fi
+
+  release_operation_lock
+  finalize_error_capture "$status"
+}
+
+trap cleanup EXIT
+
+usage() {
+  cat <<EOF
+Usage:
+  pawkup backup [--dry-run] [--local-only | --cloud-only | --all]
+  pawkup_backup [--dry-run] [--local-only | --cloud-only | --all]
+
+Backup paths come from:
+  $PAWKUP_INCLUDE_PATHS_FILE
+  $PAWKUP_EXCLUDE_PATHS_FILE
+
+Format:
+  - one path per line
+  - relative paths are under $HOME
+  - absolute paths stay absolute
+  - wildcard includes expand to matching paths before backup
+  - wildcard excludes use restic pattern matching
+EOF
+}
+
+is_interactive_run() {
+  [ -t 0 ] && [ -t 1 ]
+}
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --local-only)
+        MODE="local-only"
+        ;;
+      --cloud-only)
+        MODE="cloud-only"
+        ;;
+      --all)
+        MODE="all"
+        ;;
+      --dry-run)
+        DRY_RUN="true"
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        warn "Unknown option: $1"
+        usage >&2
+        exit 1
+        ;;
+    esac
+    shift
+  done
+}
+
+build_include_paths_file() {
+  local raw_line trimmed_line normalized_line absolute_path added_count=0
+  local -a expanded_paths=()
+
+  OUTSIDE_HOME_INCLUDE_PATHS=()
+
+  if [ ! -f "$PAWKUP_INCLUDE_PATHS_FILE" ]; then
+    warn "Include paths file not found at $PAWKUP_INCLUDE_PATHS_FILE"
+    warn "Add one path per line before running backup."
+    return 1
+  fi
+
+  PATHS_FILE="$(mktemp)"
+
+  while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+    trimmed_line="$(trim "$raw_line")"
+    case "$trimmed_line" in
+      ""|\#*)
+        continue
+        ;;
+    esac
+
+    normalized_line="$(normalize_backup_config_path "$trimmed_line")" || {
+      warn "Invalid include path in $PAWKUP_INCLUDE_PATHS_FILE: $trimmed_line"
+      return 1
+    }
+
+    if path_entry_has_glob "$normalized_line"; then
+      expanded_paths=()
+      mapfile -t expanded_paths < <(expand_backup_include_pattern "$normalized_line")
+      if [ "${#expanded_paths[@]}" -eq 0 ]; then
+        warn "Skipping unmatched include pattern: $trimmed_line"
+        continue
+      fi
+
+      for absolute_path in "${expanded_paths[@]}"; do
+        if path_is_outside_home "$absolute_path"; then
+          OUTSIDE_HOME_INCLUDE_PATHS+=("$absolute_path")
+        fi
+
+        printf '%s\n' "$absolute_path" >> "$PATHS_FILE"
+        added_count=$((added_count + 1))
+      done
+      continue
+    fi
+
+    absolute_path="$(absolute_path_from_pawkup_path_entry "$normalized_line")" || {
+      warn "Invalid include path in $PAWKUP_INCLUDE_PATHS_FILE: $trimmed_line"
+      return 1
+    }
+
+    if [ ! -e "$absolute_path" ]; then
+      warn "Skipping missing include path: $trimmed_line"
+      continue
+    fi
+
+    if path_is_outside_home "$absolute_path"; then
+      OUTSIDE_HOME_INCLUDE_PATHS+=("$absolute_path")
+    fi
+
+    printf '%s\n' "$absolute_path" >> "$PATHS_FILE"
+    added_count=$((added_count + 1))
+  done < "$PAWKUP_INCLUDE_PATHS_FILE"
+
+  if [ "$added_count" -eq 0 ]; then
+    warn "No backup paths are configured."
+    printf 'Add one path per line to %s\n' "$PAWKUP_INCLUDE_PATHS_FILE" >&2
+    printf 'Examples: ., .bashrc, ~/Documents, ~/Projects/*, /etc/ssh\n' >&2
+    return 1
+  fi
+
+  sort -u "$PATHS_FILE" -o "$PATHS_FILE"
+}
+
+expand_backup_include_pattern() {
+  local normalized_pattern="$1"
+  local absolute_pattern="" restore_shopt="" match="" canonical_match=""
+
+  absolute_pattern="$(absolute_pattern_from_pawkup_path_entry "$normalized_pattern")" || return 1
+  restore_shopt="$(shopt -p nullglob globstar dotglob || true)"
+  shopt -s nullglob globstar dotglob
+
+  while IFS= read -r match; do
+    [ -e "$match" ] || continue
+    canonical_match="$(canonicalize_path_allow_missing "$match")" || continue
+    printf '%s\n' "$canonical_match"
+  done < <(compgen -G "$absolute_pattern" || true)
+
+  eval "$restore_shopt"
+}
+
+warn_about_outside_home_backup_paths() {
+  local -a unique_paths=()
+
+  [ "${#OUTSIDE_HOME_INCLUDE_PATHS[@]}" -gt 0 ] || return 0
+
+  mapfile -t unique_paths < <(printf '%s\n' "${OUTSIDE_HOME_INCLUDE_PATHS[@]}" | awk '!seen[$0]++')
+
+  warn "Backup includes these paths outside $HOME:"
+  printf '  %s\n' "${unique_paths[@]}" >&2
+  warn "Unreadable files may fail."
+
+  if is_interactive_run; then
+    prompt_yes_no "Continue?" "y" || return 1
+  fi
+
+  return 0
+}
+
+path_is_same_or_child_of() {
+  local candidate="$1"
+  local base="$2"
+
+  if [ "$base" = "/" ]; then
+    return 0
+  fi
+
+  if [ "$candidate" = "$base" ]; then
+    return 0
+  fi
+
+  case "$candidate" in
+    "$base"/*)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+exclude_path_overlaps_include_set() {
+  local exclude_path="$1"
+  local include_path=""
+
+  while IFS= read -r include_path; do
+    [ -n "$include_path" ] || continue
+
+    if path_is_same_or_child_of "$exclude_path" "$include_path"; then
+      return 0
+    fi
+
+    if path_is_same_or_child_of "$include_path" "$exclude_path"; then
+      return 0
+    fi
+  done < "$PATHS_FILE"
+
+  return 1
+}
+
+exclude_path_contradicts_include_set() {
+  local exclude_path="$1"
+  local include_path=""
+
+  while IFS= read -r include_path; do
+    [ -n "$include_path" ] || continue
+
+    if path_is_same_or_child_of "$include_path" "$exclude_path"; then
+      return 0
+    fi
+  done < "$PATHS_FILE"
+
+  return 1
+}
+
+exclude_pattern_overlaps_include_set() {
+  local exclude_pattern="$1"
+  local literal_prefix="" include_path=""
+
+  literal_prefix="$(glob_pattern_literal_prefix_path "$exclude_pattern")" || return 1
+
+  while IFS= read -r include_path; do
+    [ -n "$include_path" ] || continue
+
+    if path_is_same_or_child_of "$literal_prefix" "$include_path"; then
+      return 0
+    fi
+
+    if path_is_same_or_child_of "$include_path" "$literal_prefix"; then
+      return 0
+    fi
+  done < "$PATHS_FILE"
+
+  return 1
+}
+
+warn_about_contradictory_excludes() {
+  [ "${#CONTRADICTORY_EXCLUDE_ENTRIES[@]}" -gt 0 ] || return 0
+
+  warn "These exclude paths contradict explicit include paths and were rejected:"
+  printf '  %s\n' "${CONTRADICTORY_EXCLUDE_ENTRIES[@]}" >&2
+  warn "A parent or same-path exclude would prevent an explicitly included path from being backed up."
+  return 1
+}
+
+add_automatic_local_repository_exclude() {
+  local local_repository_path=""
+
+  load_backup_settings >/dev/null 2>&1 || return 0
+  local_repository_path="$(canonicalize_path_allow_missing "$LOCAL_RESTIC_REPOSITORY")"
+
+  if [ "$local_repository_path" = "/" ] || [ "$local_repository_path" = "$HOME" ]; then
+    warn "Local restic repository overlaps the whole backup root; not auto-excluding $local_repository_path"
+    return 0
+  fi
+
+  if ! exclude_path_overlaps_include_set "$local_repository_path"; then
+    return 0
+  fi
+
+  printf '%s\n' "$local_repository_path" >> "$EXCLUDE_FILE"
+  info "Auto-excluding the local restic repository: $local_repository_path"
+}
+
+build_exclude_paths_file() {
+  local raw_line trimmed_line normalized_line absolute_path exclude_pattern added_count=0
+
+  CONTRADICTORY_EXCLUDE_ENTRIES=()
+  EXCLUDE_FILE="$(mktemp)"
+
+  if [ ! -f "$PAWKUP_EXCLUDE_PATHS_FILE" ]; then
+    rm -f "$EXCLUDE_FILE"
+    EXCLUDE_FILE=""
+    return 0
+  fi
+
+  while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+    trimmed_line="$(trim "$raw_line")"
+    case "$trimmed_line" in
+      ""|\#*)
+        continue
+        ;;
+    esac
+
+    normalized_line="$(normalize_backup_config_path "$trimmed_line")" || {
+      warn "Invalid exclude path in $PAWKUP_EXCLUDE_PATHS_FILE: $trimmed_line"
+      return 1
+    }
+
+    if path_entry_has_glob "$normalized_line"; then
+      exclude_pattern="$(absolute_pattern_from_pawkup_path_entry "$normalized_line")" || {
+        warn "Invalid exclude pattern in $PAWKUP_EXCLUDE_PATHS_FILE: $trimmed_line"
+        return 1
+      }
+
+      if ! exclude_pattern_overlaps_include_set "$exclude_pattern"; then
+        warn "Skipping exclude pattern outside the active include set: $trimmed_line"
+        continue
+      fi
+
+      printf '%s\n' "$exclude_pattern" >> "$EXCLUDE_FILE"
+      added_count=$((added_count + 1))
+      continue
+    fi
+
+    absolute_path="$(absolute_path_from_pawkup_path_entry "$normalized_line")" || {
+      warn "Invalid exclude path in $PAWKUP_EXCLUDE_PATHS_FILE: $trimmed_line"
+      return 1
+    }
+
+    if [ "$normalized_line" = "." ] || [ "$absolute_path" = "/" ]; then
+      warn "Exclude paths cannot be your entire home directory or filesystem root."
+      return 1
+    fi
+
+    if ! exclude_path_overlaps_include_set "$absolute_path"; then
+      warn "Skipping exclude path outside the active include set: $trimmed_line"
+      continue
+    fi
+
+    if exclude_path_contradicts_include_set "$absolute_path"; then
+      CONTRADICTORY_EXCLUDE_ENTRIES+=("$trimmed_line")
+      continue
+    fi
+
+    printf '%s\n' "$absolute_path" >> "$EXCLUDE_FILE"
+    added_count=$((added_count + 1))
+  done < "$PAWKUP_EXCLUDE_PATHS_FILE"
+
+  warn_about_contradictory_excludes || return 1
+
+  add_automatic_local_repository_exclude
+
+  if [ "$added_count" -eq 0 ]; then
+    if [ ! -s "$EXCLUDE_FILE" ]; then
+      rm -f "$EXCLUDE_FILE"
+      EXCLUDE_FILE=""
+      return 0
+    fi
+  fi
+
+  sort -u "$EXCLUDE_FILE" -o "$EXCLUDE_FILE"
+}
+
+print_effective_backup_selection() {
+  printf '\nEffective include paths:\n'
+  sed 's/^/  /' "$PATHS_FILE"
+
+  printf '\nEffective exclude patterns:\n'
+  if [ -n "$EXCLUDE_FILE" ] && [ -s "$EXCLUDE_FILE" ]; then
+    sed 's/^/  /' "$EXCLUDE_FILE"
+  else
+    printf '  <none>\n'
+  fi
+}
+
+prepare_backup_configuration() {
+  if is_interactive_run; then
+    ensure_backup_config_interactive_if_missing || return 1
+    ensure_backup_config_template
+    ensure_restic_password_interactive || return 1
+
+    if [ "$MODE" != "local-only" ]; then
+      ensure_cloud_access_interactive || return 1
+    fi
+    return 0
+  fi
+
+  if [ ! -f "$PAWKUP_ENV_FILE" ]; then
+    warn "Backup config not found at $PAWKUP_ENV_FILE"
+    warn "Run 'pawkup backup' interactively once to create it."
+    return 1
+  fi
+
+  if [ ! -f "$PAWKUP_INCLUDE_PATHS_FILE" ]; then
+    warn "Include paths file not found at $PAWKUP_INCLUDE_PATHS_FILE"
+    return 1
+  fi
+
+  if [ ! -f "$PAWKUP_EXCLUDE_PATHS_FILE" ]; then
+    warn "Exclude paths file not found at $PAWKUP_EXCLUDE_PATHS_FILE"
+    return 1
+  fi
+
+  load_backup_settings || return 1
+
+  if [ ! -r "${RESTIC_PASSWORD_FILE:-$PAWKUP_PASSWORD_FILE}" ]; then
+    warn "Repo password file not found at ${RESTIC_PASSWORD_FILE:-$PAWKUP_PASSWORD_FILE}"
+    return 1
+  fi
+
+  if [ "$MODE" != "local-only" ] && [ ! -f "$PAWKUP_RCLONE_CONFIG" ]; then
+    warn "rclone config not found at $PAWKUP_RCLONE_CONFIG"
+    return 1
+  fi
+}
+
+ensure_restic_repository() {
+  local source="$1"
+
+  info "Ensuring the $source restic repository exists"
+
+  if [ "$source" = "local" ]; then
+    mkdir -p "$(dirname "$RESTIC_REPOSITORY")"
+  fi
+
+  if restic_cmd snapshots >/dev/null 2>&1; then
+    return 0
+  fi
+
+  clear_stale_restic_locks_if_any
+  if restic_cmd snapshots >/dev/null 2>&1; then
+    return 0
+  fi
+
+  restic_cmd init
+}
+
+run_restic_backup_to_source() {
+  local source="$1"
+  local cmd=()
+  local -a retention_args=()
+
+  load_restic_config "$source" || return 1
+  clear_stale_restic_locks_if_any
+
+  if [ "$DRY_RUN" = "true" ]; then
+    if ! restic_source_repository_exists "$source"; then
+      warn "The $source repository is not initialized yet, so restic dry-run cannot inspect it."
+      return 1
+    fi
+    load_restic_config "$source" || return 1
+  else
+    ensure_restic_repository "$source"
+  fi
+
+  if [ "$DRY_RUN" = "true" ]; then
+    info "Previewing the $source restic snapshot"
+  else
+    info "Creating the $source restic snapshot"
+  fi
+  cmd=(restic --retry-lock "$PAWKUP_RESTIC_RETRY_LOCK" backup --files-from-verbatim "$PATHS_FILE" --tag "$PAWKUP_TAG")
+  if [ "$DRY_RUN" = "true" ]; then
+    cmd+=(--dry-run)
+  fi
+  if [ -n "$EXCLUDE_FILE" ]; then
+    cmd+=(--exclude-file "$EXCLUDE_FILE")
+  fi
+
+  if ! run_with_heartbeat "Backup to the $source repository is still running" "${cmd[@]}"; then
+    warn "The $source backup did not finish successfully."
+    return 1
+  fi
+
+  if [ "$DRY_RUN" = "true" ]; then
+    success "Dry-run complete. No snapshot or retention changes were written."
+    return 0
+  fi
+
+  backup_retention_args_as_array "$BACKUP_RETENTION_ARGS" || {
+    warn "BACKUP_RETENTION_ARGS is empty or invalid in $PAWKUP_ENV_FILE"
+    return 1
+  }
+  retention_args=("${BACKUP_RETENTION_ARGV[@]}")
+
+  info "Applying $source restic retention"
+  restic_cmd forget --prune --tag "$PAWKUP_TAG" "${retention_args[@]}"
+}
+
+run_requested_backups() {
+  prepare_backup_configuration || return 1
+  build_include_paths_file || return 1
+  build_exclude_paths_file || return 1
+  warn_about_outside_home_backup_paths || return 1
+  if [ "$DRY_RUN" = "true" ]; then
+    print_effective_backup_selection
+  fi
+
+  case "$MODE" in
+    local-only)
+      run_restic_backup_to_source local
+      ;;
+    cloud-only)
+      run_restic_backup_to_source cloud
+      ;;
+    all)
+      run_restic_backup_to_source local
+      run_restic_backup_to_source cloud
+      ;;
+  esac
+}
+
+main() {
+  parse_args "$@"
+  ensure_pawkup_not_running_as_root
+  maybe_reexec_with_systemd_inhibit "backup is running" "$0" "$@"
+  start_failure_log_capture "backup"
+  acquire_operation_lock "backup (--$MODE)" || exit 1
+
+  run_requested_backups
+}
+
+main "$@"

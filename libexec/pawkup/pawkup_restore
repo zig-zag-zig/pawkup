@@ -1,0 +1,941 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/pawkup_shared"
+
+ACTION="choose"
+SOURCE="cloud"
+SNAPSHOT="latest"
+TARGET_DIR=""
+declare -a INCLUDE_PATHS=()
+declare -a SNAPSHOT_SUMMARY_RECORDS=()
+PAWKUP_NO_BACKUPS_STATUS=3
+
+cleanup() {
+  local status="$?"
+  release_operation_lock
+  finalize_error_capture "$status"
+}
+
+trap cleanup EXIT
+
+usage() {
+  cat <<EOF
+Usage:
+  pawkup restore
+  pawkup restore [--source local|cloud] inspect [snapshot]
+  pawkup restore [--source local|cloud] list
+  pawkup restore [--source local|cloud] restore [snapshot] [--target DIR] [--include PATH]...
+  pawkup restore [--source local|cloud] [snapshot] [--target DIR] [--include PATH]...
+
+Notes:
+  - With no extra arguments, restore opens a snapshot picker.
+  - Restore points are shown newest first.
+  - Use -1 or oldest to select the oldest restore point.
+  - Blank target restores to original paths.
+  - --target DIR stages the restore under DIR.
+  - Staging DIR must be inside $HOME and not $HOME itself.
+  - Home paths restore under the current $HOME.
+  - Run restore as your normal user, not with sudo.
+EOF
+}
+
+ensure_restore_not_running_as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    warn "Run 'pawkup restore' as the target user, not root, so restored files get the right ownership."
+    exit 1
+  fi
+}
+
+parse_source_value() {
+  case "$1" in
+    local|cloud)
+      SOURCE="$1"
+      ;;
+    *)
+      warn "Source must be 'local' or 'cloud'."
+      exit 1
+      ;;
+  esac
+}
+
+parse_restore_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --source)
+        if [ "$#" -lt 2 ]; then
+          warn "Missing value for --source"
+          exit 1
+        fi
+        parse_source_value "$2"
+        shift 2
+        ;;
+      --target)
+        if [ "$#" -lt 2 ]; then
+          warn "Missing value for --target"
+          exit 1
+        fi
+        TARGET_DIR="$2"
+        shift 2
+        ;;
+      --include)
+        if [ "$#" -lt 2 ]; then
+          warn "Missing value for --include"
+          exit 1
+        fi
+        INCLUDE_PATHS+=("$2")
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -1)
+        if [ "$SNAPSHOT" != "latest" ]; then
+          warn "Unexpected extra argument: $1"
+          usage
+          exit 1
+        fi
+        SNAPSHOT="$1"
+        shift
+        ;;
+      -*)
+        warn "Unknown option: $1"
+        usage
+        exit 1
+        ;;
+      *)
+        if [ "$SNAPSHOT" != "latest" ]; then
+          warn "Unexpected extra argument: $1"
+          usage
+          exit 1
+        fi
+        SNAPSHOT="$1"
+        shift
+        ;;
+    esac
+  done
+}
+
+parse_args() {
+  if [ "$#" -eq 0 ]; then
+    return
+  fi
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --source)
+        if [ "$#" -lt 2 ]; then
+          warn "Missing value for --source"
+          exit 1
+        fi
+        parse_source_value "$2"
+        shift 2
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  if [ "$#" -eq 0 ]; then
+    ACTION="choose"
+    return
+  fi
+
+  case "$1" in
+    inspect)
+      ACTION="inspect"
+      shift
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --source)
+            if [ "$#" -lt 2 ]; then
+              warn "Missing value for --source"
+              exit 1
+            fi
+            parse_source_value "$2"
+            shift 2
+            ;;
+          *)
+            break
+            ;;
+        esac
+      done
+      if [ "$#" -gt 0 ]; then
+        SNAPSHOT="$1"
+        shift
+      else
+        SNAPSHOT=""
+      fi
+      ;;
+    list)
+      ACTION="list"
+      shift
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --source)
+            if [ "$#" -lt 2 ]; then
+              warn "Missing value for --source"
+              exit 1
+            fi
+            parse_source_value "$2"
+            shift 2
+            ;;
+          *)
+            break
+            ;;
+        esac
+      done
+      ;;
+    restore)
+      ACTION="restore"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      ACTION="restore"
+      ;;
+  esac
+
+  case "$ACTION" in
+    inspect)
+      if [ "$#" -gt 0 ]; then
+        warn "inspect takes at most one snapshot ID."
+        exit 1
+      fi
+      ;;
+    list)
+      if [ "$#" -gt 0 ]; then
+        warn "The list command takes no extra arguments."
+        exit 1
+      fi
+      ;;
+    restore)
+      parse_restore_args "$@"
+      ;;
+  esac
+}
+
+normalize_include_args() {
+  local raw_path normalized_path
+  NORMALIZED_INCLUDE_PATHS=()
+
+  for raw_path in "${INCLUDE_PATHS[@]}"; do
+    normalized_path="$(normalize_restore_include_path "$raw_path")" || {
+      warn "Invalid include path: $raw_path"
+      return 1
+    }
+
+    NORMALIZED_INCLUDE_PATHS+=("$normalized_path")
+  done
+}
+
+restore_source_has_no_backups() {
+  local source="${1:-cloud}"
+
+  printf 'You do not have any %s backups yet.\n' "$source"
+}
+
+restic_error_indicates_missing_repository() {
+  local error_file="$1"
+
+  grep -Eqi 'unable to open config file: .* (does not exist|no such file or directory)' "$error_file"
+}
+
+ensure_restore_source_ready() {
+  local source="${1:-cloud}"
+
+  if [ "$source" = "local" ] && ! local_restic_repository_exists; then
+    return "$PAWKUP_NO_BACKUPS_STATUS"
+  fi
+
+  if [ "$source" = "local" ] && ! local_restic_repository_has_snapshots; then
+    return "$PAWKUP_NO_BACKUPS_STATUS"
+  fi
+
+  load_restic_config "$source" || return 1
+}
+
+snapshot_summary_records() {
+  local source="${1:-cloud}"
+  local output_file="" error_file="" status=0
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 is required to list restore points."
+    return 1
+  fi
+
+  ensure_restore_source_ready "$source" || return $?
+
+  output_file="$(mktemp)"
+  error_file="$(mktemp)"
+
+  if restic_cmd snapshots --json >"$output_file" 2>"$error_file"; then
+    :
+  else
+    status=$?
+    if restic_error_indicates_missing_repository "$error_file"; then
+      rm -f "$output_file" "$error_file"
+      return "$PAWKUP_NO_BACKUPS_STATUS"
+    fi
+
+    cat "$error_file" >&2
+    rm -f "$output_file" "$error_file"
+    return "$status"
+  fi
+
+  python3 - "$output_file" <<'PY'
+import json
+import sys
+from datetime import datetime
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    snapshots = json.load(handle)
+
+records = []
+for snapshot in snapshots:
+    raw_time = snapshot.get("time", "")
+    sort_time = raw_time
+    display_time = raw_time
+    if raw_time:
+        try:
+            parsed = datetime.fromisoformat(raw_time)
+            sort_time = f"{parsed.timestamp():020.6f}"
+            display_time = parsed.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+
+    snapshot_id = snapshot.get("short_id") or snapshot.get("id", "")[:8]
+    if snapshot_id:
+        records.append((sort_time, snapshot_id, display_time))
+
+for _, snapshot_id, display_time in sorted(records, key=lambda item: item[0], reverse=True):
+    print(f"{snapshot_id}\t{display_time}")
+PY
+
+  rm -f "$output_file" "$error_file"
+}
+
+load_snapshot_summary_records() {
+  local source="${1:-cloud}"
+  local summary_file="" status=0
+
+  SNAPSHOT_SUMMARY_RECORDS=()
+  summary_file="$(mktemp)"
+
+  if snapshot_summary_records "$source" >"$summary_file"; then
+    :
+  else
+    status=$?
+    rm -f "$summary_file"
+    return "$status"
+  fi
+
+  mapfile -t SNAPSHOT_SUMMARY_RECORDS < "$summary_file"
+  rm -f "$summary_file"
+
+  if [ "${#SNAPSHOT_SUMMARY_RECORDS[@]}" -eq 0 ]; then
+    return "$PAWKUP_NO_BACKUPS_STATUS"
+  fi
+}
+
+print_snapshot_summary_list() {
+  local source="${1:-cloud}"
+  local record snapshot_id snapshot_time index=1
+
+  load_snapshot_summary_records "$source" || return $?
+
+  printf 'Restore points in the %s repository (newest first):\n' "$source"
+  for record in "${SNAPSHOT_SUMMARY_RECORDS[@]}"; do
+    IFS=$'\t' read -r snapshot_id snapshot_time <<< "$record"
+    printf '  %d. %s (%s)\n' "$index" "$snapshot_time" "$snapshot_id"
+    index=$((index + 1))
+  done
+}
+
+resolve_snapshot_selector() {
+  local selector="$1"
+  local record candidate_id
+  local record_index selection_index matches=0 matched_id=""
+
+  selector="$(trim "$selector")"
+  [ -n "$selector" ] || return 1
+
+  case "${selector,,}" in
+    -1|oldest)
+      selection_index=$((${#SNAPSHOT_SUMMARY_RECORDS[@]} - 1))
+      if [ "$selection_index" -lt 0 ]; then
+        return 1
+      fi
+
+      IFS=$'\t' read -r matched_id _ <<< "${SNAPSHOT_SUMMARY_RECORDS[$selection_index]}"
+      printf '%s\n' "$matched_id"
+      return 0
+      ;;
+  esac
+
+  if [[ "$selector" =~ ^[0-9]+$ ]]; then
+    selection_index=$((selector - 1))
+    if [ "$selection_index" -lt 0 ] || [ "$selection_index" -ge "${#SNAPSHOT_SUMMARY_RECORDS[@]}" ]; then
+      return 1
+    fi
+
+    IFS=$'\t' read -r matched_id _ <<< "${SNAPSHOT_SUMMARY_RECORDS[$selection_index]}"
+    printf '%s\n' "$matched_id"
+    return 0
+  fi
+
+  record_index=0
+  for record in "${SNAPSHOT_SUMMARY_RECORDS[@]}"; do
+    IFS=$'\t' read -r candidate_id _ <<< "$record"
+    if [ "$candidate_id" = "$selector" ]; then
+      printf '%s\n' "$candidate_id"
+      return 0
+    fi
+
+    case "$candidate_id" in
+      "$selector"*)
+        matched_id="$candidate_id"
+        matches=$((matches + 1))
+        ;;
+    esac
+    record_index=$((record_index + 1))
+  done
+
+  if [ "$matches" -eq 1 ]; then
+    printf '%s\n' "$matched_id"
+    return 0
+  fi
+
+  return 1
+}
+
+snapshot_selector_is_summary_alias() {
+  local selector=""
+
+  selector="$(trim "${1:-}")"
+  case "${selector,,}" in
+    -1|oldest)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+resolve_command_snapshot_selector() {
+  local source="$1"
+  local selector="$2"
+
+  if ! snapshot_selector_is_summary_alias "$selector"; then
+    printf '%s\n' "$selector"
+    return 0
+  fi
+
+  load_snapshot_summary_records "$source" || return $?
+  resolve_snapshot_selector "$selector"
+}
+
+format_snapshot_path_for_display() {
+  local raw_path="$1"
+
+  case "$raw_path" in
+    "$HOME")
+      printf '.\n'
+      ;;
+    "$HOME"/*)
+      printf '%s\n' "${raw_path#"$HOME"/}"
+      ;;
+    /*)
+      printf '%s\n' "$raw_path"
+      ;;
+    *)
+      printf '%s\n' "$raw_path"
+      ;;
+  esac
+}
+
+snapshot_details_json() {
+  local source="$1"
+  local snapshot="$2"
+
+  ensure_restore_source_ready "$source" || return 1
+  restic_cmd snapshots --json "$snapshot"
+}
+
+snapshot_recorded_paths_from_json() {
+  local details_file="$1"
+
+  python3 - "$details_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+
+if not data:
+    sys.exit(1)
+
+for path in data[0].get("paths", []):
+    print(path)
+PY
+}
+
+snapshot_identity_from_json() {
+  local details_file="$1"
+
+  python3 - "$details_file" <<'PY'
+import json
+import sys
+from datetime import datetime
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+
+if not data:
+    sys.exit(1)
+
+snap = data[0]
+raw_time = snap.get("time", "")
+formatted_time = raw_time
+
+if raw_time:
+    try:
+        formatted_time = datetime.fromisoformat(raw_time).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        pass
+
+print(f"{snap.get('short_id', '')}\t{formatted_time}")
+PY
+}
+
+snapshot_config_file_path() {
+  local source="$1"
+  local snapshot="$2"
+  local config_path="$3"
+  local absolute_path=""
+
+  ensure_restore_source_ready "$source" || return 1
+  absolute_path="$(canonicalize_path_allow_missing "$config_path")"
+  resolve_snapshot_path_for_restore "$snapshot" "$absolute_path"
+}
+
+snapshot_config_entries() {
+  local source="$1"
+  local snapshot="$2"
+  local relative_path="$3"
+  local snapshot_path=""
+  local raw_line trimmed_line
+
+  snapshot_path="$(snapshot_config_file_path "$source" "$snapshot" "$relative_path")" || return 1
+
+  while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+    trimmed_line="$(trim "$raw_line")"
+    case "$trimmed_line" in
+      ""|\#*)
+        continue
+        ;;
+    esac
+
+    printf '%s\n' "$trimmed_line"
+  done < <(restic_cmd dump "$snapshot" "$snapshot_path" 2>/dev/null)
+}
+
+run_restore_for_selected_snapshot() {
+  local source="$1"
+  local snapshot="$2"
+  local target_input=""
+
+  target_input="$(prompt_text 'Restore target [blank=original, path=stage]: ')"
+  if [ -z "$(trim "$target_input")" ]; then
+    exec "$0" --source "$source" restore "$snapshot"
+  fi
+
+  exec "$0" --source "$source" restore "$snapshot" --target "$target_input"
+}
+
+inspect_snapshot() {
+  local source="$1"
+  local snapshot="$2"
+  local details_file=""
+  local snapshot_identity=""
+  local snapshot_id=""
+  local snapshot_time=""
+  local -a recorded_paths=()
+  local -a include_entries=()
+  local -a exclude_entries=()
+  local path=""
+  local include_known="0"
+  local exclude_known="0"
+  local action=""
+  local snapshot_status=0
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 is required to inspect snapshot details."
+    return 1
+  fi
+
+  if snapshot_summary_records "$source" >/dev/null; then
+    :
+  else
+    snapshot_status=$?
+    return "$snapshot_status"
+  fi
+
+  details_file="$(mktemp)"
+  snapshot_details_json "$source" "$snapshot" > "$details_file" || {
+    rm -f "$details_file"
+    return 1
+  }
+
+  snapshot_identity="$(snapshot_identity_from_json "$details_file")" || {
+    rm -f "$details_file"
+    warn "Could not read snapshot details."
+    return 1
+  }
+  IFS=$'\t' read -r snapshot_id snapshot_time <<< "$snapshot_identity"
+
+  while IFS= read -r path; do
+    recorded_paths+=("$(format_snapshot_path_for_display "$path")")
+  done < <(snapshot_recorded_paths_from_json "$details_file")
+
+  if snapshot_config_file_path "$source" "$snapshot" "$PAWKUP_INCLUDE_PATHS_FILE" >/dev/null 2>&1; then
+    include_known="1"
+    while IFS= read -r path; do
+      include_entries+=("$path")
+    done < <(snapshot_config_entries "$source" "$snapshot" "$PAWKUP_INCLUDE_PATHS_FILE")
+  fi
+
+  if snapshot_config_file_path "$source" "$snapshot" "$PAWKUP_EXCLUDE_PATHS_FILE" >/dev/null 2>&1; then
+    exclude_known="1"
+    while IFS= read -r path; do
+      exclude_entries+=("$path")
+    done < <(snapshot_config_entries "$source" "$snapshot" "$PAWKUP_EXCLUDE_PATHS_FILE")
+  fi
+
+  rm -f "$details_file"
+
+  printf 'Restore point: %s\n' "$snapshot_time"
+  printf 'Snapshot ID:    %s\n' "$snapshot_id"
+  printf 'Source:         %s\n' "$source"
+  printf '\n'
+  printf 'Restic source paths in this snapshot:\n'
+  if [ "${#recorded_paths[@]}" -eq 0 ]; then
+    printf '  <none>\n'
+  else
+    printf '  %s\n' "${recorded_paths[@]}"
+  fi
+
+  printf '\n'
+  printf 'Configured include paths stored in this snapshot:\n'
+  if [ "$include_known" = "1" ]; then
+    if [ "${#include_entries[@]}" -eq 0 ]; then
+      printf '  <none>\n'
+    else
+      printf '  %s\n' "${include_entries[@]}"
+    fi
+  else
+    printf '  <not stored in this snapshot>\n'
+  fi
+
+  printf '\n'
+  printf 'Configured exclude paths stored in this snapshot:\n'
+  if [ "$exclude_known" = "1" ]; then
+    if [ "${#exclude_entries[@]}" -eq 0 ]; then
+      printf '  <none>\n'
+    else
+      printf '  %s\n' "${exclude_entries[@]}"
+    fi
+  else
+    printf '  <not stored in this snapshot>\n'
+  fi
+
+  if [ ! -t 0 ]; then
+    return 0
+  fi
+
+  while true; do
+    printf '\n'
+    printf '1. Restore this snapshot\n'
+    printf '2. Back to restore points\n'
+    printf '3. Quit\n'
+
+    action="$(prompt_text 'Choose an option: ')"
+    case "${action,,}" in
+      1|r|restore)
+        run_restore_for_selected_snapshot "$source" "$snapshot"
+        return 0
+        ;;
+      2|b|back)
+        return 0
+        ;;
+      3|q|quit)
+        exit 0
+        ;;
+      *)
+        warn "Choose 1, 2, or 3."
+        ;;
+    esac
+  done
+}
+
+interactive_snapshot_picker() {
+  local source="${1:-cloud}"
+  local selection=""
+  local action="restore"
+  local selector=""
+  local snapshot_id=""
+  local command_word=""
+  local remainder=""
+
+  load_snapshot_summary_records "$source" || return $?
+
+  while true; do
+    printf 'Restore points in the %s repository (newest first):\n' "$source"
+    local record index=1 snapshot_time=""
+    for record in "${SNAPSHOT_SUMMARY_RECORDS[@]}"; do
+      IFS=$'\t' read -r snapshot_id snapshot_time <<< "$record"
+      printf '  %d. %s (%s)\n' "$index" "$snapshot_time" "$snapshot_id"
+      index=$((index + 1))
+    done
+
+    printf '\n'
+    printf 'Enter a list number, -1 for oldest, oldest, or snapshot ID to restore.\n'
+    printf 'Type i followed by the same kind of selection to inspect first.\n'
+    printf 'Type q to quit.\n'
+    printf 'Examples: 1   -1   oldest   49273f5c   i 1   i -1   q\n'
+
+    selection="$(prompt_text 'Choose a restore point: ')"
+    case "${selection,,}" in
+      q|quit)
+        return 0
+        ;;
+    esac
+
+    command_word="$(trim "${selection%% *}")"
+    remainder="${selection#"$command_word"}"
+    remainder="$(trim "$remainder")"
+    action="restore"
+    selector="$selection"
+
+    case "${command_word,,}" in
+      i|inspect)
+        action="inspect"
+        selector="$remainder"
+        ;;
+    esac
+
+    if [ -z "$selector" ]; then
+      warn "Enter a listed number, -1, oldest, or snapshot ID."
+      printf '\n'
+      continue
+    fi
+
+    snapshot_id="$(resolve_snapshot_selector "$selector")" || {
+      warn "Pick a listed number, -1, oldest, or snapshot ID."
+      printf '\n'
+      continue
+    }
+
+    case "$action" in
+      inspect)
+        inspect_snapshot "$source" "$snapshot_id" || return 1
+        ;;
+      restore)
+        run_restore_for_selected_snapshot "$source" "$snapshot_id"
+        return 0
+        ;;
+    esac
+
+    printf '\n'
+  done
+}
+
+prepare_target_directory() {
+  local requested="$1"
+  local normalized="" canonical_home=""
+
+  if [ -z "$(trim "$requested")" ]; then
+    printf '/\n'
+    return 0
+  fi
+
+  normalized="$(canonicalize_path_allow_missing "$(normalize_home_path "$requested")")"
+  canonical_home="$(canonicalize_path_allow_missing "$HOME")"
+
+  if ! path_is_inside_home "$normalized"; then
+    warn "Use blank for original paths, or stage inside $HOME."
+    return 1
+  fi
+
+  if [ "$normalized" = "$canonical_home" ]; then
+    warn "Staging target cannot be $HOME itself."
+    return 1
+  fi
+
+  if [ -e "$normalized" ] && [ ! -d "$normalized" ]; then
+    warn "$normalized exists but is not a directory."
+    return 1
+  fi
+
+  if [ ! -d "$normalized" ]; then
+    if [ -t 0 ]; then
+      ensure_target_directory_interactive "$normalized" || return 1
+    else
+      warn "Target directory does not exist: $normalized"
+      return 1
+    fi
+  fi
+
+  printf '%s\n' "$normalized"
+}
+
+main() {
+  local target="" status=0
+
+  parse_args "$@"
+  ensure_restore_not_running_as_root
+
+  case "$ACTION" in
+    restore)
+      maybe_reexec_with_systemd_inhibit "restore or repository access is running" "$0" "$@"
+      start_failure_log_capture "restore"
+      acquire_operation_lock "$SOURCE restore ($ACTION)" || exit 1
+      ;;
+    *)
+      start_failure_log_capture "restore"
+      ;;
+  esac
+
+  case "$ACTION" in
+    choose)
+      if [ ! -t 0 ]; then
+        warn "Use 'pawkup restore list' in non-interactive mode."
+        exit 1
+      fi
+      if interactive_snapshot_picker "$SOURCE"; then
+        :
+      else
+        status=$?
+        case "$status" in
+          "$PAWKUP_NO_BACKUPS_STATUS")
+            restore_source_has_no_backups "$SOURCE"
+            exit 0
+            ;;
+          *)
+            exit "$status"
+            ;;
+        esac
+      fi
+      ;;
+    inspect)
+      if [ -n "$SNAPSHOT" ]; then
+        if SNAPSHOT="$(resolve_command_snapshot_selector "$SOURCE" "$SNAPSHOT")"; then
+          :
+        else
+          status=$?
+          case "$status" in
+            "$PAWKUP_NO_BACKUPS_STATUS")
+              restore_source_has_no_backups "$SOURCE"
+              exit 0
+              ;;
+            *)
+              exit "$status"
+              ;;
+          esac
+        fi
+
+        if inspect_snapshot "$SOURCE" "$SNAPSHOT"; then
+          :
+        else
+          status=$?
+          case "$status" in
+            "$PAWKUP_NO_BACKUPS_STATUS")
+              restore_source_has_no_backups "$SOURCE"
+              exit 0
+              ;;
+            *)
+              exit "$status"
+              ;;
+          esac
+        fi
+      elif [ -t 0 ]; then
+        if interactive_snapshot_picker "$SOURCE"; then
+          :
+        else
+          status=$?
+          case "$status" in
+            "$PAWKUP_NO_BACKUPS_STATUS")
+              restore_source_has_no_backups "$SOURCE"
+              exit 0
+              ;;
+            *)
+              exit "$status"
+              ;;
+          esac
+        fi
+      else
+        warn "Provide a snapshot ID for inspect in non-interactive mode."
+        exit 1
+      fi
+      ;;
+    list)
+      if print_snapshot_summary_list "$SOURCE"; then
+        :
+      else
+        status=$?
+        case "$status" in
+          "$PAWKUP_NO_BACKUPS_STATUS")
+            restore_source_has_no_backups "$SOURCE"
+            exit 0
+            ;;
+          *)
+            exit "$status"
+            ;;
+        esac
+      fi
+      ;;
+    restore)
+      if SNAPSHOT="$(resolve_command_snapshot_selector "$SOURCE" "$SNAPSHOT")"; then
+        :
+      else
+        status=$?
+        case "$status" in
+          "$PAWKUP_NO_BACKUPS_STATUS")
+            restore_source_has_no_backups "$SOURCE"
+            exit 0
+            ;;
+          *)
+            exit "$status"
+            ;;
+        esac
+      fi
+
+      target="$(prepare_target_directory "$TARGET_DIR")" || exit 1
+
+      normalize_include_args || exit 1
+      if restore_snapshot_to_target "$SOURCE" "$SNAPSHOT" "$target" "${NORMALIZED_INCLUDE_PATHS[@]}"; then
+        :
+      else
+        status=$?
+        case "$status" in
+          "$PAWKUP_NO_BACKUPS_STATUS")
+            restore_source_has_no_backups "$SOURCE"
+            exit 0
+            ;;
+          *)
+            exit "$status"
+            ;;
+        esac
+      fi
+      ;;
+  esac
+}
+
+main "$@"

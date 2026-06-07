@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2088
+set -euo pipefail
+
+TEST_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$TEST_DIR/.." && pwd)"
+PAWKUP_LIBEXEC_DIR="$SCRIPT_DIR/libexec/pawkup"
+TEST_TMP_ROOT="$(mktemp -d)"
+
+PASS_COUNT=0
+
+trap 'rm -rf "$TEST_TMP_ROOT"' EXIT
+
+fail() {
+  printf 'FAIL: %s\n' "$1" >&2
+  exit 1
+}
+
+assert_contains() {
+  local file_path="$1"
+  local pattern="$2"
+
+  if ! grep -Fq -- "$pattern" "$file_path"; then
+    printf 'Expected to find: %s\n' "$pattern" >&2
+    printf 'In file: %s\n' "$file_path" >&2
+    sed -n '1,160p' "$file_path" >&2
+    exit 1
+  fi
+}
+
+assert_not_contains() {
+  local file_path="$1"
+  local pattern="$2"
+
+  if grep -Fq -- "$pattern" "$file_path"; then
+    printf 'Did not expect to find: %s\n' "$pattern" >&2
+    printf 'In file: %s\n' "$file_path" >&2
+    sed -n '1,160p' "$file_path" >&2
+    exit 1
+  fi
+}
+
+run_test() {
+  local name="$1"
+  shift
+
+  printf '==> %s\n' "$name"
+  "$@"
+  PASS_COUNT=$((PASS_COUNT + 1))
+}
+
+write_basic_config() {
+  local home_dir="$1"
+  local repository="$2"
+  local password_file="$home_dir/.config/pawkup/restic-password"
+
+  mkdir -p "$home_dir/.config/pawkup"
+  printf 'old-password\n' > "$password_file"
+  chmod 600 "$password_file"
+
+  cat > "$home_dir/.config/pawkup/backup.env" <<EOF
+BACKUP_REPOSITORY_NAME="pawkup"
+LOCAL_RESTIC_REPOSITORY="$repository"
+CLOUD_RESTIC_REPOSITORY="rclone:gdrive:pawkup"
+RESTIC_PASSWORD_FILE="$password_file"
+BACKUP_SCHEDULE_MODE="local-only"
+BACKUP_ON_CALENDAR="weekly"
+BACKUP_PERSISTENT="true"
+BACKUP_ACCURACY_SEC="1min"
+BACKUP_SCHEDULE_DESCRIPTION="Weekly"
+BACKUP_RETENTION_DESCRIPTION="Keep last 5"
+BACKUP_RETENTION_ARGS="--keep-last 5"
+EOF
+
+  cat > "$home_dir/.config/pawkup/include-paths.txt" <<'EOF'
+.
+EOF
+
+  cat > "$home_dir/.config/pawkup/exclude-paths.txt" <<'EOF'
+**/node_modules
+EOF
+}
+
+test_backup_excludes_wildcards_and_local_repo() {
+  local tmp_dir="" home_dir="" repo="" password_file="" ls_file=""
+
+  tmp_dir="$(mktemp -d "$TEST_TMP_ROOT/backup.XXXXXX")"
+  home_dir="$tmp_dir/home"
+  repo="$home_dir/pawkup"
+  password_file="$home_dir/.config/pawkup/restic-password"
+  ls_file="$tmp_dir/snapshot-ls.txt"
+
+  mkdir -p "$home_dir/project/src" "$home_dir/project/node_modules/pkg" "$home_dir/nested/tool/node_modules/pkg"
+  printf 'keep\n' > "$home_dir/project/src/app.js"
+  printf 'drop\n' > "$home_dir/project/node_modules/pkg/index.js"
+  printf 'drop\n' > "$home_dir/nested/tool/node_modules/pkg/index.js"
+
+  write_basic_config "$home_dir" "$repo"
+
+  HOME="$home_dir" PAWKUP_INHIBITED=1 "$PAWKUP_LIBEXEC_DIR/pawkup_backup" --local-only >/dev/null
+
+  RESTIC_PASSWORD_FILE="$password_file" restic -r "$repo" ls latest > "$ls_file"
+  assert_contains "$ls_file" "$home_dir/project/src/app.js"
+  assert_not_contains "$ls_file" "node_modules"
+  assert_not_contains "$ls_file" "$home_dir/pawkup"
+}
+
+test_backup_dry_run_prints_effective_selection() {
+  local tmp_dir="" home_dir="" repo="" output_file=""
+
+  tmp_dir="$(mktemp -d "$TEST_TMP_ROOT/dry-run.XXXXXX")"
+  home_dir="$tmp_dir/home"
+  repo="$home_dir/pawkup"
+  output_file="$tmp_dir/dry-run.txt"
+
+  mkdir -p "$home_dir/project/src"
+  printf 'keep\n' > "$home_dir/project/src/app.js"
+  write_basic_config "$home_dir" "$repo"
+
+  HOME="$home_dir" PAWKUP_INHIBITED=1 "$PAWKUP_LIBEXEC_DIR/pawkup_backup" --local-only >/dev/null
+  HOME="$home_dir" PAWKUP_INHIBITED=1 "$PAWKUP_LIBEXEC_DIR/pawkup_backup" --dry-run --local-only > "$output_file"
+
+  assert_contains "$output_file" "Effective include paths:"
+  assert_contains "$output_file" "Effective exclude patterns:"
+  assert_contains "$output_file" "node_modules"
+  assert_contains "$output_file" "Dry-run complete."
+}
+
+test_home_prefixed_exclude_is_supported() {
+  local tmp_dir="" home_dir="" repo="" password_file="" ls_file=""
+
+  tmp_dir="$(mktemp -d "$TEST_TMP_ROOT/home-exclude.XXXXXX")"
+  home_dir="$tmp_dir/home"
+  repo="$home_dir/pawkup"
+  password_file="$home_dir/.config/pawkup/restic-password"
+  ls_file="$tmp_dir/snapshot-ls.txt"
+
+  mkdir -p "$home_dir/.cache" "$home_dir/docs"
+  printf 'drop\n' > "$home_dir/.cache/cached.txt"
+  printf 'keep\n' > "$home_dir/docs/keep.txt"
+  write_basic_config "$home_dir" "$repo"
+  printf '~/.cache\n' > "$home_dir/.config/pawkup/exclude-paths.txt"
+
+  HOME="$home_dir" PAWKUP_INHIBITED=1 "$PAWKUP_LIBEXEC_DIR/pawkup_backup" --local-only >/dev/null
+
+  RESTIC_PASSWORD_FILE="$password_file" restic -r "$repo" ls latest > "$ls_file"
+  assert_contains "$ls_file" "$home_dir/docs/keep.txt"
+  assert_not_contains "$ls_file" "$home_dir/.cache/cached.txt"
+}
+
+test_home_prefixed_include_is_supported() {
+  local tmp_dir="" home_dir="" repo="" password_file="" ls_file=""
+
+  tmp_dir="$(mktemp -d "$TEST_TMP_ROOT/home-include.XXXXXX")"
+  home_dir="$tmp_dir/home"
+  repo="$home_dir/pawkup"
+  password_file="$home_dir/.config/pawkup/restic-password"
+  ls_file="$tmp_dir/snapshot-ls.txt"
+
+  mkdir -p "$home_dir/docs" "$home_dir/other"
+  printf 'keep\n' > "$home_dir/docs/keep.txt"
+  printf 'drop\n' > "$home_dir/other/drop.txt"
+  write_basic_config "$home_dir" "$repo"
+  printf '~/docs\n' > "$home_dir/.config/pawkup/include-paths.txt"
+  : > "$home_dir/.config/pawkup/exclude-paths.txt"
+
+  HOME="$home_dir" PAWKUP_INHIBITED=1 "$PAWKUP_LIBEXEC_DIR/pawkup_backup" --local-only >/dev/null
+
+  RESTIC_PASSWORD_FILE="$password_file" restic -r "$repo" ls latest > "$ls_file"
+  assert_contains "$ls_file" "$home_dir/docs/keep.txt"
+  assert_not_contains "$ls_file" "$home_dir/other/drop.txt"
+}
+
+test_child_exclude_under_parent_include_is_allowed() {
+  local tmp_dir="" home_dir="" repo="" password_file="" ls_file=""
+
+  tmp_dir="$(mktemp -d "$TEST_TMP_ROOT/child-exclude.XXXXXX")"
+  home_dir="$tmp_dir/home"
+  repo="$home_dir/pawkup"
+  password_file="$home_dir/.config/pawkup/restic-password"
+  ls_file="$tmp_dir/snapshot-ls.txt"
+
+  mkdir -p "$home_dir/a/b" "$home_dir/a/c"
+  printf 'drop\n' > "$home_dir/a/b/file.txt"
+  printf 'keep\n' > "$home_dir/a/c/file.txt"
+  write_basic_config "$home_dir" "$repo"
+  printf 'a\n' > "$home_dir/.config/pawkup/include-paths.txt"
+  printf 'a/b\n' > "$home_dir/.config/pawkup/exclude-paths.txt"
+
+  HOME="$home_dir" PAWKUP_INHIBITED=1 "$PAWKUP_LIBEXEC_DIR/pawkup_backup" --local-only >/dev/null
+
+  RESTIC_PASSWORD_FILE="$password_file" restic -r "$repo" ls latest > "$ls_file"
+  assert_contains "$ls_file" "$home_dir/a/c/file.txt"
+  assert_not_contains "$ls_file" "$home_dir/a/b/file.txt"
+}
+
+test_parent_excludes_covering_includes_are_rejected_together() {
+  local tmp_dir="" home_dir="" repo="" output_file=""
+
+  tmp_dir="$(mktemp -d "$TEST_TMP_ROOT/contradictory-excludes.XXXXXX")"
+  home_dir="$tmp_dir/home"
+  repo="$home_dir/pawkup"
+  output_file="$tmp_dir/output.txt"
+
+  mkdir -p "$home_dir/a/b" "$home_dir/x/y"
+  printf 'keep\n' > "$home_dir/a/b/file.txt"
+  printf 'keep\n' > "$home_dir/x/y/file.txt"
+  write_basic_config "$home_dir" "$repo"
+  printf 'a/b\n~/x/y\n' > "$home_dir/.config/pawkup/include-paths.txt"
+  printf 'a\n~/x\n' > "$home_dir/.config/pawkup/exclude-paths.txt"
+
+  if HOME="$home_dir" PAWKUP_INHIBITED=1 "$PAWKUP_LIBEXEC_DIR/pawkup_backup" --local-only > "$output_file" 2>&1; then
+    fail "backup succeeded even though excludes cover explicit include paths"
+  fi
+
+  assert_contains "$output_file" "These exclude paths contradict explicit include paths and were rejected:"
+  assert_contains "$output_file" "  a"
+  assert_contains "$output_file" "  ~/x"
+  assert_contains "$output_file" "A parent or same-path exclude would prevent an explicitly included path from being backed up."
+  assert_not_contains "$output_file" "Creating the local restic snapshot"
+}
+
+test_rsync_progress_uses_stable_total_option() {
+  local output_file=""
+
+  output_file="$(mktemp "$TEST_TMP_ROOT/rsync-options.XXXXXX")"
+  bash -c '
+    set -euo pipefail
+    source "$1/pawkup_shared"
+    rsync_copy_options
+  ' bash "$PAWKUP_LIBEXEC_DIR" > "$output_file"
+
+  assert_contains "$output_file" "--no-inc-recursive"
+  assert_contains "$output_file" "--info=progress2"
+}
+
+test_restore_list_uses_snapshot_json() {
+  local tmp_dir="" home_dir="" repo="" output_file=""
+
+  tmp_dir="$(mktemp -d "$TEST_TMP_ROOT/restore-list.XXXXXX")"
+  home_dir="$tmp_dir/home"
+  repo="$home_dir/pawkup"
+  output_file="$tmp_dir/restore-list.txt"
+
+  mkdir -p "$home_dir/project"
+  printf 'keep\n' > "$home_dir/project/file.txt"
+  write_basic_config "$home_dir" "$repo"
+
+  HOME="$home_dir" PAWKUP_INHIBITED=1 "$PAWKUP_LIBEXEC_DIR/pawkup_backup" --local-only >/dev/null
+  HOME="$home_dir" PAWKUP_INHIBITED=1 "$PAWKUP_LIBEXEC_DIR/pawkup_restore" --source local list > "$output_file"
+
+  assert_contains "$output_file" "Restore points in the local repository"
+  grep -Eq '  1\. [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} \([0-9a-f]{8}\)' "$output_file" || {
+    sed -n '1,80p' "$output_file" >&2
+    fail "restore list did not print the expected JSON-derived summary"
+  }
+}
+
+test_repository_health_check() {
+  local tmp_dir="" home_dir="" repo="" output_file=""
+
+  tmp_dir="$(mktemp -d "$TEST_TMP_ROOT/check.XXXXXX")"
+  home_dir="$tmp_dir/home"
+  repo="$home_dir/pawkup"
+  output_file="$tmp_dir/check.txt"
+
+  mkdir -p "$home_dir/project"
+  printf 'keep\n' > "$home_dir/project/file.txt"
+  write_basic_config "$home_dir" "$repo"
+
+  HOME="$home_dir" PAWKUP_INHIBITED=1 "$PAWKUP_LIBEXEC_DIR/pawkup_backup" --local-only >/dev/null
+  HOME="$home_dir" PAWKUP_INHIBITED=1 "$PAWKUP_LIBEXEC_DIR/pawkup_check" --source local --metadata-only > "$output_file"
+
+  assert_contains "$output_file" "Checking the local restic repository"
+}
+
+test_restic_password_rotation() {
+  local tmp_dir="" home_dir="" repo="" old_password_file="" new_password_file=""
+
+  tmp_dir="$(mktemp -d "$TEST_TMP_ROOT/rotate.XXXXXX")"
+  home_dir="$tmp_dir/home"
+  repo="$home_dir/pawkup"
+  old_password_file="$home_dir/.config/pawkup/restic-password"
+  new_password_file="$tmp_dir/new-password"
+
+  mkdir -p "$home_dir/project"
+  printf 'keep\n' > "$home_dir/project/file.txt"
+  write_basic_config "$home_dir" "$repo"
+
+  HOME="$home_dir" PAWKUP_INHIBITED=1 "$PAWKUP_LIBEXEC_DIR/pawkup_backup" --local-only >/dev/null
+  printf 'new-password\n' > "$new_password_file"
+  chmod 600 "$new_password_file"
+
+  HOME="$home_dir" bash -c '
+    set -euo pipefail
+    source "$1/pawkup_shared"
+    rotate_restic_repository_passwords "$2" "$3" local >/dev/null
+  ' bash "$PAWKUP_LIBEXEC_DIR" "$new_password_file" "$old_password_file"
+
+  RESTIC_PASSWORD_FILE="$old_password_file" restic -r "$repo" snapshots >/dev/null
+  printf 'old-password\n' > "$tmp_dir/old-password"
+  if RESTIC_PASSWORD_FILE="$tmp_dir/old-password" restic -r "$repo" snapshots >/dev/null 2>&1; then
+    fail "old restic password still unlocked the repository"
+  fi
+}
+
+test_recommended_exclude_presets_include_common_cache_dirs() {
+  local tmp_dir="" output_file=""
+
+  tmp_dir="$(mktemp -d "$TEST_TMP_ROOT/presets.XXXXXX")"
+  output_file="$tmp_dir/recommended-excludes.txt"
+
+  HOME="$tmp_dir/home" bash -c '
+    set -euo pipefail
+    source "$1/pawkup_shared"
+    recommended_exclude_presets
+  ' bash "$PAWKUP_LIBEXEC_DIR" > "$output_file"
+
+  assert_contains "$output_file" "~/tmp"
+  assert_contains "$output_file" "~/temp"
+  assert_contains "$output_file" "~/.tmp"
+  assert_contains "$output_file" "~/.temp"
+  assert_contains "$output_file" "~/.npm"
+  assert_contains "$output_file" "~/.nvm"
+  assert_contains "$output_file" "~/.gradle/caches"
+  assert_contains "$output_file" "~/.local/state/pawkup/logs"
+  assert_contains "$output_file" "~/.local/state/pawkup/restore-staging"
+  assert_contains "$output_file" "**/.git/modules"
+}
+
+main() {
+  command -v restic >/dev/null 2>&1 || fail "restic is required for these tests"
+  command -v python3 >/dev/null 2>&1 || fail "python3 is required for these tests"
+
+  run_test "recommended excludes include common cache dirs" test_recommended_exclude_presets_include_common_cache_dirs
+  run_test "backup excludes wildcard node_modules and local repository" test_backup_excludes_wildcards_and_local_repo
+  run_test "backup dry-run prints effective selection" test_backup_dry_run_prints_effective_selection
+  run_test "home-prefixed exclude is supported" test_home_prefixed_exclude_is_supported
+  run_test "home-prefixed include is supported" test_home_prefixed_include_is_supported
+  run_test "child exclude under parent include is allowed" test_child_exclude_under_parent_include_is_allowed
+  run_test "parent excludes covering includes are rejected together" test_parent_excludes_covering_includes_are_rejected_together
+  run_test "restore rsync progress uses stable total option" test_rsync_progress_uses_stable_total_option
+  run_test "restore list uses JSON snapshots" test_restore_list_uses_snapshot_json
+  run_test "repository health check runs" test_repository_health_check
+  run_test "restic password rotation updates keys" test_restic_password_rotation
+
+  printf 'Passed %d pawkup tests.\n' "$PASS_COUNT"
+}
+
+main "$@"
